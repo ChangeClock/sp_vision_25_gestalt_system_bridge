@@ -557,24 +557,42 @@ int main(int argc, char ** argv)
 
     // The probe is deliberately non-firing and restores the entry pose before
     // allowing normal control to continue.
-    const auto restore_deadline = std::chrono::steady_clock::now() + 3s;
+    // Reversing a physical turret immediately after the response probe must
+    // first bleed the commanded-direction momentum. Use the same angular
+    // tolerance as the later bootstrap alignment and require consecutive
+    // samples, so a real non-response still fails without rejecting normal
+    // settling near the entry pose.
+    constexpr double kRestoreToleranceDegrees = 1.5;
+    constexpr int kRequiredRestoreSamples = 2;
+    const auto restore_deadline = std::chrono::steady_clock::now() + 5s;
     bool restored = false;
+    int consecutive_restore_samples = 0;
+    std::optional<double> restore_yaw, restore_pitch;
     while (std::chrono::steady_clock::now() < restore_deadline) {
       link.exec(fmt::format("UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, *yaw0, *pitch0));
       std::this_thread::sleep_for(100ms);
-      const auto yaw = link.attr(sentry, ga::kTurretYaw);
-      const auto pitch = link.attr(sentry, ga::kTurretPitch);
+      restore_yaw = link.attr(sentry, ga::kTurretYaw);
+      restore_pitch = link.attr(sentry, ga::kTurretPitch);
       if (
-        yaw && pitch && angle_error_degrees(*yaw, *yaw0) <= 0.75 &&
-        std::abs(*pitch - *pitch0) <= 0.75) {
-        restored = true;
-        break;
+        restore_yaw && restore_pitch &&
+        angle_error_degrees(*restore_yaw, *yaw0) <= kRestoreToleranceDegrees &&
+        std::abs(*restore_pitch - *pitch0) <= kRestoreToleranceDegrees) {
+        if (++consecutive_restore_samples >= kRequiredRestoreSamples) {
+          restored = true;
+          break;
+        }
+      } else {
+        consecutive_restore_samples = 0;
       }
     }
     if (!responded || !restored) {
       tools::logger()->error(
-        "[gestalt] {} takeover gate failed: RBExtAim response={} pose_restore={} map={}", phase,
-        responded, restored, sentry);
+        "[gestalt] {} takeover gate failed: RBExtAim response={} pose_restore={} map={} "
+        "restore_yaw={:.2f} yaw_error={:.2f} restore_pitch={:.2f} pitch_error={:.2f}",
+        phase, responded, restored, sentry, restore_yaw.value_or(0.0),
+        restore_yaw ? angle_error_degrees(*restore_yaw, *yaw0) : -1.0,
+        restore_pitch.value_or(0.0),
+        restore_pitch ? std::abs(*restore_pitch - *pitch0) : -1.0);
       return false;
     }
     tools::logger()->info(
