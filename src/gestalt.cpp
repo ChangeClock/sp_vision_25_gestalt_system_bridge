@@ -862,9 +862,15 @@ int main(int argc, char ** argv)
       hp_seen = false;
       hp_prev = -1;
       scan_active = false;
-      // Claim + gun view survive by pid, but the pawn may be new — re-assert.
+      // Claim + gun view survive by pid, but the pawn is NEW — re-assert the
+      // view AND the camera rig: the fresh pawn reverts to the chassis preset
+      // (Tower 400cm boom + FOV 90), which silently breaks the fov-25
+      // intrinsics and gun-socket extrinsics for every life after the first
+      // (observed: damage_dealt 377 → 15 across otherwise identical matches).
       link.exec("ExtAimClaim 0 1");
       link.exec("UEExec RBTakeOver 0");
+      std::this_thread::sleep_for(500ms);
+      link.apply_camera(camera_json);
       tools::logger()->info(
         "[gestalt] game revived our sentry after {:.0f}s: map={} (life {})",
         last_revive_wait_s, sentry, lives_lost + 1);
