@@ -216,7 +216,8 @@ int main(int argc, char ** argv)
   int bench_target_hp = 0;                        // >0: boost so the round can't kill it
   double bench_damage_per_hit = 20.0;             // HP per damaging 17mm hit
   double bench_boot_pitch = 10.0;                 // outpost drum sits high; ground cars: 0
-  bool bench_match = false;  // live-match takeover: claim the match sentry, no spawn/drive
+  bool bench_match = false;  // live-match takeover: spawn+claim pid 0, then start the match
+  int bench_shooter_team = 1;  // 1 = blue (default), 0 = red
   try {
     auto yroot = YAML::LoadFile(config);
     auto ystr = [&](const char * k, std::string & dst) {
@@ -246,6 +247,8 @@ int main(int argc, char ** argv)
     if (yroot["bench_boot_pitch"].IsDefined())
       bench_boot_pitch = yroot["bench_boot_pitch"].as<double>();
     if (yroot["bench_match"].IsDefined()) bench_match = yroot["bench_match"].as<bool>();
+    if (yroot["bench_shooter_team"].IsDefined())
+      bench_shooter_team = yroot["bench_shooter_team"].as<int>();
   } catch (...) {
   }
   const bool bench_vehicle = !bench_match && bench_target == "vehicle";
@@ -263,33 +266,42 @@ int main(int argc, char ** argv)
 
   if (bench_match) {
     // ---------- LIVE-MATCH takeover ----------
-    // Claim the match-owned blue sentry's turret + fire; chassis and economy
-    // stay with the built-in AI (AIMoveMode/allowance untouched). ExtAimClaim
-    // re-asserts AITargetMode=90 after every strategy tick, so the claim
-    // survives the coach for the whole match.
-    if (!wait_for(
-          [&] {
-            auto m = link.find_vehicle(bench_shooter_class, 1);
-            if (!m) return false;
-            sentry = *m;
-            return link.attr(sentry, ga::kPlayerId).has_value();
-          },
-          180)) {
-      tools::logger()->error(
-        "[gestalt] no live blue sentry (class {}) appeared in the match", bench_shooter_class);
+    // Ordering per the acceptance spec: manually SPAWN our sentry in the prep
+    // stage, CLAIM its turret/fire, arm the camera/bridge, and only THEN start
+    // the match — the vehicle is externally owned from second zero (claiming a
+    // roster sentry after the whistle landed mid-fight: hp already 340/260 by
+    // claim time, and the roster pawn's camera came up in TPS, which
+    // invalidates the fov-25 first-person intrinsics; a pid-0 Respawn car uses
+    // the same first-person takeover view as the bench). Chassis and economy
+    // stay with the built-in AI after the claim.
+    wait_for([&] { return link.match_status() >= 0; }, 60);
+    if (link.match_status() >= 1)
+      tools::logger()->warn("[gestalt] match already running — claiming late");
+    const int prev_map = link.find_player(0).value_or(-1);
+    bool spawned = false;
+    for (int attempt = 0; attempt < 3 && !spawned; ++attempt) {
+      link.exec(fmt::format("Respawn 0 {} {}", bench_shooter_entity, bench_shooter_team));
+      spawned = wait_for(
+        [&] {
+          auto cur = link.find_player(0);
+          return cur && *cur > prev_map && link.attr(*cur, ga::kHealth).value_or(0) > 0;
+        },
+        15);
+    }
+    if (!spawned) {
+      tools::logger()->error("[gestalt] match sentry spawn failed after retries");
       return 1;
     }
-    ext_pid = static_cast<int>(link.attr(sentry, ga::kPlayerId).value_or(-1));
-    if (ext_pid < 0) {
-      tools::logger()->error("[gestalt] match sentry map={} has no player id", sentry);
-      return 1;
-    }
+    sentry = *link.find_player(0);
+    ext_pid = 0;
     outpost = link.find_red_outpost().value_or(-1);
-    tools::logger()->info(
-      "[gestalt] match takeover: sentry map={} pid={} hp={}", sentry, ext_pid,
-      link.attr(sentry, ga::kHealth).value_or(-1));
-    link.exec(fmt::format("ExtAimClaim {} 1", ext_pid));
-    link.exec(fmt::format("UEExec RBTakeOver {}", ext_pid));  // viewport = its gun view
+    link.exec(fmt::format("SetAttribute 0 {} 1", ga::kIsAI));
+    link.exec(fmt::format("SetAttribute 0 {} 90", ga::kTargetMode));
+    link.exec("ExtAimClaim 0 1");
+    link.exec("UEExec RBTakeOver 0");  // pid-0 pawn: same first-person gun view as the bench
+    // One-time starting ammo grant (Respawn leaves the player allowance at 0);
+    // in-match resupply afterwards is the built-in AI's business.
+    link.exec(fmt::format("SetAttribute 0 {} {}", ga::kAllowance17mm, bench_allowance));
     link.exec("UEExec r.MotionBlurQuality 0");
     link.exec("UEExec r.AntiAliasingMethod 1");
     link.exec("UEExec r.RobotNav.DebugDraw 0");
@@ -298,6 +310,14 @@ int main(int argc, char ** argv)
     std::this_thread::sleep_for(2s);
     link.apply_camera(camera_json);
     std::this_thread::sleep_for(1500ms);
+    if (link.match_status() < 1) {
+      tools::logger()->info("[gestalt] armed — starting the match with pid 0 already claimed");
+      link.exec("SetMatchStatus 1");
+      wait_for([&] { return link.match_status() >= 1; }, 30);
+    }
+    tools::logger()->info(
+      "[gestalt] match takeover: sentry map={} pid=0 team={} hp={} match_status={}", sentry,
+      bench_shooter_team, link.attr(sentry, ga::kHealth).value_or(-1), link.match_status());
   } else {
   // ---------- prep-stage setup (mirrors tools/outpost_benchmark.py) ----------
   if (do_setup) {
@@ -309,9 +329,9 @@ int main(int argc, char ** argv)
     bool spawned = false;
     for (int attempt = 0; attempt < 3 && !spawned; ++attempt) {
       // Shooter chassis comes from the config (Mario 66000008 default; sentry
-      // bench uses 66000012). Team must be blue at spawn time so armor
+      // bench uses 66000012). Team must be set at spawn time so armor
       // emissive color and detector class are correct.
-      link.exec(fmt::format("Respawn 0 {} 1", bench_shooter_entity));
+      link.exec(fmt::format("Respawn 0 {} {}", bench_shooter_entity, bench_shooter_team));
       // Respawn is asynchronous.  An older alive sentry may remain in the
       // attribute cache, so merely finding class/team can return immediately
       // with stale map telemetry.  Wait for the newly allocated (higher) map.
@@ -335,10 +355,11 @@ int main(int argc, char ** argv)
   sentry = *sentry_opt;
   if (
     static_cast<int>(link.attr(sentry, ga::kClass).value_or(-1)) != bench_shooter_class ||
-    static_cast<int>(link.attr(sentry, ga::kTeamId).value_or(-1)) != 1) {
+    static_cast<int>(link.attr(sentry, ga::kTeamId).value_or(-1)) != bench_shooter_team) {
     tools::logger()->error(
-      "[gestalt] pid-0 vehicle is not the expected blue shooter (map={} class={} want={})",
-      sentry, link.attr(sentry, ga::kClass).value_or(-1), bench_shooter_class);
+      "[gestalt] pid-0 vehicle is not the expected shooter (map={} class={} want={} team={})",
+      sentry, link.attr(sentry, ga::kClass).value_or(-1), bench_shooter_class,
+      bench_shooter_team);
     return 1;
   }
   double boot_bearing_deg = -83.3;  // outpost-lob point → red outpost, map-4 fallback
@@ -660,7 +681,14 @@ int main(int argc, char ** argv)
   // BulletFiredTotal): "shots" must mean rounds that LEFT THE GUN, not trigger
   // requests — the loop re-asserts fire across consecutive frames while the
   // gun is rate/heat-limited, so command counts run absurdly high.
-  const double fired0 = link.attr(sentry, ga::kBulletsFired).value_or(0);
+  double fired0 = link.attr(sentry, ga::kBulletsFired).value_or(0);
+  double fired_carry = 0;  // rounds fired in previous lives (match respawns)
+  // Combat effectiveness (match mode): cumulative damage dealt, per-life
+  // baselined because a respawn starts a fresh combat map.
+  double dealt_base = link.attr(sentry, ga::kDamageApplied).value_or(0);
+  double last_dealt = dealt_base, dealt_carry = 0;
+  int lives_lost = 0;
+  double last_revive_wait_s = 0;
 
   // Async debug window: imshow/waitKey stall 40-80ms on this box — feeding a
   // UI thread through a latest-frame mailbox keeps the vision loop under the
@@ -769,16 +797,82 @@ int main(int argc, char ** argv)
     // the fallback if the counter attribute is not in this build's telemetry).
     const auto bf_now = link.attr(sentry, ga::kBulletsFired);
     const double fired =
-      bf_now ? std::max(0.0, *bf_now - fired0) : std::max(0.0, allow0 - allow);
+      fired_carry +
+      (bf_now ? std::max(0.0, *bf_now - fired0) : std::max(0.0, allow0 - allow));
+    if (const auto dd = link.attr(sentry, ga::kDamageApplied)) last_dealt = *dd;
     if (hp_prev > 0 && hp > 0 && hp < hp_prev)
       hp_drop_hist[static_cast<int>(std::lround(hp_prev - hp))]++;
     if (hp > 0) hp_prev = hp;
     if (hp > 0) hp_seen = true;
     // Only honor hp==0 after a live reading: at boot the attribute may simply
     // not have arrived yet (value_or(0) — the 0.12-sweep instant-exit race).
-    if ((hp_seen && hp == 0) || (!bench_match && hp_seen && allow <= 0)) break;
+    if (hp_seen && hp == 0) {
+      if (!bench_match) break;
+      // Match takeover: our sentry died — it revives (buy-revive/auto), so
+      // re-acquire the new combat map and keep the claim for the next life.
+      lives_lost++;
+      dealt_carry += std::max(0.0, last_dealt - dealt_base);
+      fired_carry = fired;
+      tools::logger()->info(
+        "[gestalt] own sentry down (life {} lost, dealt so far {:.0f}) — waiting for revive",
+        lives_lost, dealt_carry);
+      // Revival belongs to the GAME's own logic (sentry auto/buy-revive) — we
+      // only park the vision loop, display the live revive progress, and wait
+      // for the vehicle to come back on its own.
+      const int dead_map = sentry;
+      const auto t_dead0 = std::chrono::steady_clock::now();
+      int new_map = -1;
+      bool match_over = false;
+      while (!ui_quit) {
+        const double waited =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t_dead0).count();
+        if (waited > 180.0) break;
+        if (link.match_status() >= 2) {
+          match_over = true;
+          break;
+        }
+        auto cur = link.find_player(0);
+        if (cur && link.attr(*cur, ga::kHealth).value_or(0) > 0) {
+          new_map = *cur;
+          break;
+        }
+        const double rp = link.attr(dead_map, ga::kReviveProgress).value_or(0);
+        const double rpm = link.attr(dead_map, ga::kReviveProgressMax).value_or(0);
+        cv::Mat card(720, 1280, CV_8UC3, cv::Scalar(25, 25, 25));
+        tools::draw_text(card, "SENTRY DOWN", {500, 320}, {0, 0, 255});
+        tools::draw_text(
+          card,
+          fmt::format("revive {:.0f}/{:.0f}  waited {:.0f}s  lives_lost {}", rp, rpm, waited,
+                      lives_lost),
+          {380, 380}, {0, 255, 255});
+        {
+          std::lock_guard<std::mutex> lk(ui_mu);
+          card.copyTo(ui_frame);
+        }
+        std::this_thread::sleep_for(500ms);
+      }
+      if (match_over || ui_quit || new_map < 0) break;
+      last_revive_wait_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_dead0).count();
+      sentry = new_map;
+      probe = new_map;
+      fired0 = link.attr(sentry, ga::kBulletsFired).value_or(0);
+      dealt_base = link.attr(sentry, ga::kDamageApplied).value_or(0);
+      last_dealt = dealt_base;
+      hp_seen = false;
+      hp_prev = -1;
+      scan_active = false;
+      // Claim + gun view survive by pid, but the pawn may be new — re-assert.
+      link.exec("ExtAimClaim 0 1");
+      link.exec("UEExec RBTakeOver 0");
+      tools::logger()->info(
+        "[gestalt] game revived our sentry after {:.0f}s: map={} (life {})",
+        last_revive_wait_s, sentry, lives_lost + 1);
+      continue;
+    }
+    if (!bench_match && hp_seen && allow <= 0) break;
     // Match takeover: economy belongs to the built-in AI (allowance may dip to
-    // 0 until it re-buys), so only our own death or a settled match ends the run.
+    // 0 until it re-buys), so only a settled match (or timeout) ends the run.
     if (bench_match && link.match_status() >= 2) break;
 
     auto now = std::chrono::steady_clock::now();
@@ -1482,6 +1576,13 @@ int main(int argc, char ** argv)
         {static_cast<int>(a.center.x) - 40, static_cast<int>(a.center.y) - 14},
         {255, 200, 0}, 0.5);
     }
+    // Own status: health, revive accounting and running combat effectiveness.
+    tools::draw_text(
+      img,
+      fmt::format("self hp:{:.0f} lives_lost:{} dealt:{:.0f} last_revive_wait:{:.0f}s",
+                  bench_match ? hp : link.attr(sentry, ga::kHealth).value_or(-1), lives_lost,
+                  dealt_carry + std::max(0.0, last_dealt - dealt_base), last_revive_wait_s),
+      {10, 30}, {0, 200, 255});
     tools::draw_text(
       img,
       fmt::format(
@@ -1557,7 +1658,10 @@ int main(int argc, char ** argv)
   const double allow_final = link.attr(sentry, ga::kAllowance17mm).value_or(0);
   const auto bf_final = link.attr(sentry, ga::kBulletsFired);
   const double used =
-    bf_final ? std::max(0.0, *bf_final - fired0) : std::max(0.0, allow0 - allow_final);
+    fired_carry +
+    (bf_final ? std::max(0.0, *bf_final - fired0) : std::max(0.0, allow0 - allow_final));
+  if (const auto dd = link.attr(sentry, ga::kDamageApplied)) last_dealt = *dd;
+  const double dealt = dealt_carry + std::max(0.0, last_dealt - dealt_base);
   const double hits = (hp0 - hp_final) / bench_damage_per_hit;
   link.exec(fmt::format("ExtAimClaim {} 0", ext_pid));
   if (bench_vehicle) {
@@ -1588,9 +1692,9 @@ int main(int argc, char ** argv)
   }
   tools::logger()->info(
     "[gestalt] RESULT={} hp {}->{} damaging_hits={} bullets={} hit_rate={:.3f} "
-    "frames={} det_rate={:.3f} fire_cmds={} dmg_per_hit={}",
+    "frames={} det_rate={:.3f} fire_cmds={} dmg_per_hit={} damage_dealt={:.0f} lives_lost={}",
     hp_final == 0 ? "DESTROYED" : "PARTIAL", hp0, hp_final, hits, used,
     used > 0 ? hits / used : 0.0, frames, frames > 0 ? 1.0 * det_frames / frames : 0.0,
-    fire_cmds, bench_damage_per_hit);
+    fire_cmds, bench_damage_per_hit, dealt, lives_lost);
   return hp_final == 0 ? 0 : 2;
 }

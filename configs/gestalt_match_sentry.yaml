@@ -1,21 +1,29 @@
-# LIVE-MATCH sentry takeover: sp_vision owns the match-owned BLUE SENTRY's
-# turret + fire for a whole real AI match; chassis navigation and economy stay
-# with the built-in AI. Requires a normally started match (no -SkipMatchStart):
+# LIVE-MATCH sentry takeover: sp_vision spawns a RED SENTRY in the prep stage,
+# claims its turret + fire, arms the camera/bridge, and only then STARTS the
+# match — externally owned from second zero. Chassis navigation and economy
+# stay with the built-in AI. Launch the game held in prep (-SkipMatchStart):
 #
-#   powershell -File scripts/ai-match-selftest.ps1 -MatchObserveSeconds 900 `
-#       -MapId 4 -ResX 1280 -ResY 720 -HudHidden 1 -Muted 1
+#   powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 `
+#       -MatchObserveSeconds 900 -MapId 4 -ResX 1280 -ResY 720
 #   .\build\Release\gestalt.exe <ws-port> configs\gestalt_match_sentry.yaml --timeout=600
 #
-# The bridge claims the sentry via ExtAimClaim (per-tick AITargetMode=90
-# rewrite), views through its gun (RBTakeOver), and adds an idle scan: after
-# 2s without a fire solution the turret sweeps at 60°/s, freezing whenever raw
-# detections appear so the tracker can lock. Exit on own death / match end.
+# The bridge claims pid 0 via ExtAimClaim (per-tick AITargetMode=90 rewrite),
+# views through its first-person gun (RBTakeOver 0 — a roster pawn's camera
+# comes up in TPS and breaks the fov-25 intrinsics), and adds an idle scan:
+# after 2s without a fire solution the turret sweeps at 60°/s, freezing while
+# raw detections are present so the tracker can lock. On death: revival is the
+# game's own business — the bridge only shows the live revive progress and
+# re-asserts claim + gun view once the game brings the sentry back. Exit on
+# match end / timeout.
 
-enemy_color: "red"
+enemy_color: "blue"                # red sentry shoots BLUE targets
 
 #####----- bench scenario -----#####
 bench_match: true
-bench_shooter_class: 1004          # blue sentry class id
+bench_shooter_entity: "66000005"   # SentryRobotEntity — HACHISEN (SKM_Sentry) chassis
+bench_shooter_class: 1004          # sentry class id (career-based, same both teams)
+bench_shooter_team: 0              # 0 = red, 1 = blue
+bench_allowance: 400               # starting 17mm grant; resupply is the AI's business
 
 #####----- detector / yolo -----#####
 yolo_name: yolo11
@@ -69,4 +77,7 @@ distort_coeffs: [0, 0, 0, 0, 0]
 sim_quad_scale: 1.192
 z_adapter: false
 v_adapter: true
-camera_json: '{"enabled":1,"fovDegrees":25,"shutterSpeed":120,"iso":600}'
+# armLength:0 retracts the sentry chassis "Tower" camera boom (400cm chase arm
+# in Camera.csv → third-person view + broken gun-socket extrinsics) back to a
+# true first-person mount. Requires the matching game-side applySettings key.
+camera_json: '{"enabled":1,"fovDegrees":25,"shutterSpeed":120,"iso":600,"armLength":0}'

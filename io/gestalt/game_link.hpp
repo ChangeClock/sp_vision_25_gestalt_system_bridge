@@ -32,6 +32,9 @@ constexpr int kTurretYaw = 10000111, kTurretPitch = 10000112;
 constexpr int kHealth = 10000003, kHealthMax = 60000004;
 constexpr int kAllowance17mm = 10000033, kReal17mm = 10000031;
 constexpr int kBulletsFired = 63000002;
+constexpr int kDamageApplied = 63000000;   // cumulative damage dealt by the vehicle
+constexpr int kReviveProgress = 10000022;  // fills toward kReviveProgressMax while dead
+constexpr int kReviveProgressMax = 60000017;
 constexpr int kShooterRealSpeed = 10000030;  // per-shot muzzle speed, cm/s
 constexpr int kIsAI = 50000088, kMoveMode = 50000089, kTargetMode = 50000090;
 constexpr int kMoveMarker = 50000097;

@@ -66,7 +66,20 @@ powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSe
 - 车辆靶血量：先抬 `HealthMax(60000004)` 再抬 `Health(10000003)`，否则被钳回默认值。
 - 靶车必须在**哨兵视野内的半场**：蓝方哨兵在前哨吊射点的可视点位 = 红前哨、蓝堡垒 `(0.03,7.72)m`、DeploymentBlue `(-5.20,8.50)m`；红方堡垒 `(0.1,-7.2)m` 被遮挡（实测 det 0.005）。
 - 尸体陷阱：不要在测试点击杀靶车——灭灯板仍可被检出，会污染下一轮 EKF（实测 w 塌缩到 0、100 发全打尸体零伤害）。teardown 只 release 不击杀。
-- 英雄靶两个专属项：yolo 必须开 `sim_one_as_big: true`（否则 check_type 在检测层抹掉全部英雄板，det=0）；到达判定用 `bench_target_goal_radius_cm: 350`（英雄级底盘 AutoPath 停靠带 ~3m）。英雄长途导航可能中途搁浅（z 陷地、任意 goto 不响应），换车分段路点（东走廊 `(500,800)→(-100,900)→(-520,850)`）可绕开。
+- 英雄靶两个专属项：到达判定用 `bench_target_goal_radius_cm: 350`（英雄级底盘 AutoPath 停靠带 ~3m）。英雄长途导航可能中途搁浅（z 陷地、任意 goto 不响应），换车分段路点（东走廊 `(500,800)→(-100,900)→(-520,850)`）可绕开。（英雄板曾被 yolo 层整体抹掉：上游类目表把 one 错标为 small 与 check_type 矛盾——已在 armor.hpp 根修为 big，`sim_one_as_big` 退役。）
+
+### 实战整局接管（gestalt_match_sentry.yaml）
+
+`bench_match: true` 走"赛前接管"编排：prep 阶段手动生成 HACHISEN 哨兵（`66000005`，SKM_Sentry 底盘）→ mode90+ExtAimClaim+RBTakeOver 认领 → 布相机/帧桥 → 自己发 `SetMatchStatus 1` 开赛——**比赛第 0 秒即外控**。底盘导航与补给经济全留给内置 AI；阵亡后复活交给游戏逻辑，桥只显示复活进度并在复活后重挂视角。丢锁 >2s 时云台 60°/s 巡扫（有原始检测即冻结让 tracker 收敛）。
+
+```powershell
+powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSeconds 900 -MapId 4 -ResX 1280 -ResY 720
+.\build\Release\gestalt.exe <ws-port> configs\gestalt_match_sentry.yaml --timeout=600
+```
+
+- **哨兵底盘的 Tower 相机预设自带 400cm 追尾吊臂**（`Camera.csv`），接管即第三人称且破坏枪口外参——camera_json 里 `"armLength":0` 收回吊臂（需配套的游戏侧 applySettings 键，2026-07-13 已落地）。
+- RESULT 增加 `damage_dealt=`（DamageAppliedTotal 差值，跨命累计）与 `lives_lost=`；match 模式下 hp 口径=自身存活，damaging_hits/hit_rate 无意义。
+- 2026-07-13 整局基线（红方 HACHISEN，~6.3min）：183 发、det 0.264、对敌伤害 377（≈8.5% 实战命中）、阵亡 4 次全部由游戏复活并自动续接，内置 AI 经济中途补弹至 700+。
 
 ## 1 功能介绍
 自瞄的定义和意义。我们对自瞄的定义为“针对移动装甲板目标的自动瞄准和自动火控软件”。当操作手切换成自瞄模式后，自瞄会接管云台的控制权，通过对敌方运动轨迹的预测和弹道解算，控制云台进行追踪；同时，自瞄还会接管发射机构的控制权，判断开火时机。自瞄的意义在于提高我方作战能力，实现短击杀时间、高命中率的作战效果。 
