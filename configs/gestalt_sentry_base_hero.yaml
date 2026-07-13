@@ -32,10 +32,9 @@ yolo11_model_path: assets/yolo11.xml
 classify_model: assets/tiny_resnet.onnx
 device: CPU
 min_confidence: 0.4
-# Sim renders the hero plate with small-armor keypoint geometry; without this
-# remap check_type erases every hero detection at the yolo stage (det=0 with
-# the hero lit and centered — 2026-07-13). Same key gestalt_far_blue.yaml uses.
-sim_one_as_big: true
+# (sim_one_as_big retired 2026-07-13: armor_properties now maps one->big at the
+# source — the upstream table erroneously declared hero armor small, which
+# check_type then erased unconditionally.)
 roi: { x: 320, y: 26, width: 640, height: 640 }
 use_roi: true
 

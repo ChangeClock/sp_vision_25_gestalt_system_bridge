@@ -51,7 +51,12 @@ enum ArmorPriority
 // clang-format off
 const std::vector<std::tuple<Color, ArmorName, ArmorType>> armor_properties = {
   {blue, sentry, small},     {red, sentry, small},     {extinguish, sentry, small},
-  {blue, one, small},        {red, one, small},        {extinguish, one, small},
+  // Hero (one) carries the 230mm BIG armor module. The original small entries
+  // contradicted check_type's own rulebook prior ("small can never be one/base")
+  // so every hero detection was erased unconditionally; and even bypassing the
+  // check, type=small feeds solvePnP the 135mm object model (~1.7x range error).
+  // Real-footage paths are affected the same way as the simulator.
+  {blue, one, big},          {red, one, big},          {extinguish, one, big},
   {blue, two, small},        {red, two, small},        {extinguish, two, small},
   {blue, three, small},      {red, three, small},      {extinguish, three, small},
   {blue, four, small},       {red, four, small},       {extinguish, four, small},
