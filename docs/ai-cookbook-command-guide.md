@@ -131,17 +131,22 @@ $env:PATH = '<opencv-vc16-bin>;<openvino-libs>;' + $env:PATH
 3. `SetAttribute 0 50000088 1`；不要在 claim 前自行写 TargetMode 90。
 4. `ExtAimClaim 0 1` 原子保存旧 TargetMode 并切到 90，再 `UEExec RBTakeOver 0`；
    独立 RAII 线程每 1 秒重复同一 claim（5 秒无续租会自动恢复），因此模型推理、
-   共享内存等待或 UI 阻塞不会误丢 lease；死亡等待期间停租。
+   共享内存等待或 UI 阻塞不会误丢 lease；死亡等待前先停续租并显式发送
+   `ExtAimClaim 0 0`，复活后再重新 claim。
 5. 应用相机（必须含 `armLength:0`）并初始化共享帧协议 v3；要求至少 3 个
    frame id/QPC 严格递增的新帧同时满足 1280x720、FOV 25°、实际 armLength 0，且
    identity flags bit0..2 全为 1、player/map 等于当前接管 pid/map、ViewActor unique id
    非零且等于 takeover target、三帧 takeover epoch 相同且非零。
-6. 从 AttributeMap 确认 TargetMode=90，以 fire=0 下发小角度 `RBExtAim`，并从
-   `TurretYaw/TurretPitch` 证明到达后恢复原姿态。只有全部效果门通过才发送
+6. 从 AttributeMap 确认 TargetMode=90。复活路径还要等待 `Defeated=0`、
+   `CanOperate=1`、`IsChassisOnline=1`、`Weakened=0`，且死亡物理姿态已恢复到可用的
+   炮口 pitch 角域；随后才以 fire=0 下发小角度 `RBExtAim`，并从
+   `TurretYaw/TurretPitch` 严格证明双轴到达后恢复原姿态。瞬态未到达会在回位、短暂稳定后
+   用反向 yaw 再探一次，仍不能证明则硬失败。只有全部效果门通过才发送
    `SetMatchStatus 1`；底盘移动与经济仍由内置 AI 管理。
-7. 每次复活只接受 map id 严格大于尸体 map 且四重身份仍正确的新存活 pawn，再按
-   **claim → takeover → apply camera** 重挂；重复 mode90、连续帧、FOV/armLength 和
-   小角度响应效果门后才恢复控制循环。
+7. 每次复活只接受 HP 已经从 0 回到正值、map id 等于尸体 map（原地复活）或严格更高
+   （重建 pawn）且四重身份仍正确的存活 pawn，再按 **claim → takeover → apply camera**
+   重挂；重复 mode90、连续帧、FOV/armLength、物理就绪和小角度响应效果门后才恢复控制循环。
+   死亡等待沿用整场 `--timeout` 的总截止时间，不另设更短的 180 秒截断。
 8. WS/采集一旦中断，恢复后必须重新执行 **claim → takeover → apply camera** 与
    mode90、frame/FOV/armLength、RBExtAim 响应全门；不能证明就安全失败。WS 与像素流
    必须属于同一监听/writer PID。
@@ -200,13 +205,14 @@ README 的三份配置：
 
 - AttributeMap 观察到 `MatchStatus: 0 → 1 → 2`，而不是仅因 600 秒超时退出。
 - `frames>0`、`det_rate>0`、`bullets>0`、`damage_dealt>0`。
-- 每次死亡后出现新存活 map，`lives_lost` 与复活次数一致；复活后的 FOV、
-  `armLength:0`、mode90 与外控角度响应仍成立。
+- 每次死亡后出现同 map 原地复活或更高 map 的重建复活，`lives_lost` 与复活次数一致；
+  复活后的 FOV、`armLength:0`、mode90 与外控角度响应仍成立。
 - 每次生命的 BulletFired/DamageApplied 只结转一次；若比赛恰在死亡等待中结束，
   RESULT 不得把最后一条命重复计入 `bullets`/`damage_dealt`。此时 combat map 可能已被
   回收并把 TeamID 改为休眠哨兵值；验收沿用该生命存活期已通过的 HACHISEN 身份，
-  release 后停 heartbeat 满 5s，并以不存在存活控制对象作为安全交还证明，不读取回收
-  map 中可能冻结的 TargetMode=90 作为失败依据。
+  死亡时立即停 heartbeat 并显式 release；teardown 再次幂等 release，并在 5 秒验证窗内
+  以不存在存活控制对象作为安全交还证明，不读取回收 map 中可能冻结的 TargetMode=90
+  作为失败依据。
 - 扫描期间 yaw 速率按真实时间接近 60°/s；原始检测出现时不继续扫；长卡帧后
   单帧步进不超过 `60 * 0.20 = 12°`。
 - `RESULT=MATCH_COMPLETE` 且进程退出码为 0；该裁决同时要求
@@ -215,9 +221,14 @@ README 的三份配置：
   takeover/revive/recovery 效果门、`pid0_hachisen=1`、`frame_writer_gate=1`、
   `view_identity_gate=1`、非零 `takeover_epoch`、`ws_continuity_gate=1`、
   `capture_recovery_gate=1`，以及 release 后的二选一安全门：活体 pid current map 的
-  TargetMode 不再为 90；或自然结算恰逢死亡时，无存活控制对象且 heartbeat 已停止满
-  5 秒的 terminal-inactive lease 门。
+  TargetMode 不再为 90；或自然结算恰逢死亡时，显式 release 已发送、无存活控制对象且
+  heartbeat 在 5 秒验证窗内保持停止的 terminal-inactive 门。
   任一条件不满足均为 `MATCH_FAILED`/退出码 2。
+
+2026-07-14 使用 CI 包体 `v0.1.9.65-preview` 的实测基线：红方 HACHISEN 自然完整对局
+约 7.1 分钟，144 发、伤害 324、命中率 11.2%、`det_rate=0.260`、阵亡 4 次；前三次
+同 map 原地复活均通过 FOV25/armLength0/身份/外控响应重挂，末次在自然结算时通过
+terminal-inactive release，最终上述全部 RESULT 门为 true 且游戏日志无 claim lease error。
 
 ## 6. 最终 Shipping 的无日志判定
 

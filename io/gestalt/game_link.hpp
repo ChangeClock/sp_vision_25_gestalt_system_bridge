@@ -31,6 +31,8 @@ constexpr int kPosX = 10000107, kPosY = 10000108, kPosZ = 10000109;
 constexpr int kChassisYaw = 10000110;
 constexpr int kTurretYaw = 10000111, kTurretPitch = 10000112;
 constexpr int kHealth = 10000003, kHealthMax = 60000004;
+constexpr int kWeakened = 50000002, kDefeated = 50000007;
+constexpr int kIsChassisOnline = 50000014, kCanOperate = 50000021;
 constexpr int kAllowance17mm = 10000033, kReal17mm = 10000031;
 constexpr int kBulletsFired = 63000002;
 constexpr int kDamageApplied = 63000000;   // cumulative damage dealt by the vehicle

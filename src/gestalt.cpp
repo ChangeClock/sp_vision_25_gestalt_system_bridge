@@ -523,80 +523,148 @@ int main(int argc, char ** argv)
     std::this_thread::sleep_for(500ms);
     if (!ensure_frame_stream() || !verify_frame_contract(phase)) return false;
 
-    std::optional<double> yaw0, pitch0;
-    if (!wait_for(
-          [&] {
-            yaw0 = link.attr(sentry, ga::kTurretYaw);
-            pitch0 = link.attr(sentry, ga::kTurretPitch);
-            return yaw0.has_value() && pitch0.has_value();
-          },
-          3, 0.1)) {
-      tools::logger()->error("[gestalt] {} takeover gate failed: turret telemetry absent", phase);
+    // An in-place revive publishes HP>0 before the formerly hidden vehicle has
+    // necessarily recovered from its death pose. RBExtAim's world-to-motor
+    // conversion deliberately uses the game's flat-ground approximation, so a
+    // nearly vertical muzzle (71 degrees observed in a real HACHISEN revive)
+    // is not a valid actuator test even though the command and Hive handle are
+    // already available. Wait for the game-owned recovery gates and a sane
+    // world-pitch envelope before applying the strict two-axis effect probe.
+    constexpr double kTakeoverProbePitchEnvelopeDegrees = 55.0;
+    std::optional<double> ready_yaw, ready_pitch;
+    const bool actuator_ready = wait_for(
+      [&] {
+        ready_yaw = link.attr(sentry, ga::kTurretYaw);
+        ready_pitch = link.attr(sentry, ga::kTurretPitch);
+        return link.attr(sentry, ga::kHealth).value_or(0) > 0 &&
+               static_cast<int>(link.attr(sentry, ga::kDefeated).value_or(1)) == 0 &&
+               static_cast<int>(link.attr(sentry, ga::kCanOperate).value_or(0)) == 1 &&
+               static_cast<int>(link.attr(sentry, ga::kIsChassisOnline).value_or(0)) == 1 &&
+               static_cast<int>(link.attr(sentry, ga::kWeakened).value_or(1)) == 0 && ready_yaw &&
+               ready_pitch && std::abs(*ready_pitch) <= kTakeoverProbePitchEnvelopeDegrees;
+      },
+      30, 0.1);
+    if (!actuator_ready) {
+      tools::logger()->error(
+        "[gestalt] {} takeover gate failed: actuator not physically ready map={} "
+        "hp={:.0f} defeated={:.0f} can_operate={:.0f} chassis_online={:.0f} "
+        "weakened={:.0f} yaw={:.2f} pitch={:.2f}",
+        phase, sentry, link.attr(sentry, ga::kHealth).value_or(-1),
+        link.attr(sentry, ga::kDefeated).value_or(-1),
+        link.attr(sentry, ga::kCanOperate).value_or(-1),
+        link.attr(sentry, ga::kIsChassisOnline).value_or(-1),
+        link.attr(sentry, ga::kWeakened).value_or(-1), ready_yaw.value_or(0.0),
+        ready_pitch.value_or(0.0));
       return false;
     }
 
-    const double target_yaw = std::remainder(*yaw0 + 3.0, 360.0);
-    const double target_pitch =
-      *pitch0 + (std::abs(*pitch0) < 1.0 ? 2.0 : (*pitch0 > 0 ? -2.0 : 2.0));
-    const auto response_deadline = std::chrono::steady_clock::now() + 5s;
-    bool responded = false;
-    while (std::chrono::steady_clock::now() < response_deadline) {
-      link.exec(fmt::format(
-        "UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, target_yaw, target_pitch));
-      std::this_thread::sleep_for(100ms);
-      const auto yaw = link.attr(sentry, ga::kTurretYaw);
-      const auto pitch = link.attr(sentry, ga::kTurretPitch);
-      if (
-        yaw && pitch && angle_error_degrees(*yaw, target_yaw) <= 0.75 &&
-        std::abs(*pitch - target_pitch) <= 0.75 && angle_error_degrees(*yaw, *yaw0) >= 1.5 &&
-        std::abs(*pitch - *pitch0) >= 0.75) {
-        responded = true;
-        break;
-      }
-    }
-
-    // The probe is deliberately non-firing and restores the entry pose before
-    // allowing normal control to continue.
-    // Reversing a physical turret immediately after the response probe must
-    // first bleed the commanded-direction momentum. Use the same angular
-    // tolerance as the later bootstrap alignment and require consecutive
-    // samples, so a real non-response still fails without rejecting normal
-    // settling near the entry pose.
+    constexpr int kResponseAttempts = 2;
     constexpr double kRestoreToleranceDegrees = 1.5;
     constexpr int kRequiredRestoreSamples = 2;
-    const auto restore_deadline = std::chrono::steady_clock::now() + 5s;
+    bool responded = false;
     bool restored = false;
-    int consecutive_restore_samples = 0;
-    std::optional<double> restore_yaw, restore_pitch;
-    while (std::chrono::steady_clock::now() < restore_deadline) {
-      link.exec(fmt::format("UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, *yaw0, *pitch0));
-      std::this_thread::sleep_for(100ms);
-      restore_yaw = link.attr(sentry, ga::kTurretYaw);
-      restore_pitch = link.attr(sentry, ga::kTurretPitch);
-      if (
-        restore_yaw && restore_pitch &&
-        angle_error_degrees(*restore_yaw, *yaw0) <= kRestoreToleranceDegrees &&
-        std::abs(*restore_pitch - *pitch0) <= kRestoreToleranceDegrees) {
-        if (++consecutive_restore_samples >= kRequiredRestoreSamples) {
-          restored = true;
+    std::optional<double> yaw0, pitch0, response_yaw, response_pitch, restore_yaw,
+      restore_pitch;
+    double best_yaw_error = std::numeric_limits<double>::infinity();
+    double best_pitch_error = std::numeric_limits<double>::infinity();
+    double max_yaw_motion = 0.0;
+    double max_pitch_motion = 0.0;
+    int passed_attempt = 0;
+
+    for (int attempt = 1; attempt <= kResponseAttempts && !responded; ++attempt) {
+      yaw0.reset();
+      pitch0.reset();
+      if (!wait_for(
+            [&] {
+              yaw0 = link.attr(sentry, ga::kTurretYaw);
+              pitch0 = link.attr(sentry, ga::kTurretPitch);
+              return yaw0.has_value() && pitch0.has_value();
+            },
+            3, 0.1)) {
+        tools::logger()->error("[gestalt] {} takeover gate failed: turret telemetry absent", phase);
+        return false;
+      }
+
+      const double yaw_step = attempt % 2 == 1 ? 3.0 : -3.0;
+      const double target_yaw = std::remainder(*yaw0 + yaw_step, 360.0);
+      const double target_pitch =
+        *pitch0 + (std::abs(*pitch0) < 1.0 ? 2.0 : (*pitch0 > 0 ? -2.0 : 2.0));
+      const auto response_deadline = std::chrono::steady_clock::now() + 5s;
+      while (std::chrono::steady_clock::now() < response_deadline) {
+        link.exec(fmt::format(
+          "UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, target_yaw, target_pitch));
+        std::this_thread::sleep_for(100ms);
+        response_yaw = link.attr(sentry, ga::kTurretYaw);
+        response_pitch = link.attr(sentry, ga::kTurretPitch);
+        if (!response_yaw || !response_pitch) continue;
+        const double yaw_error = angle_error_degrees(*response_yaw, target_yaw);
+        const double pitch_error = std::abs(*response_pitch - target_pitch);
+        const double yaw_motion = angle_error_degrees(*response_yaw, *yaw0);
+        const double pitch_motion = std::abs(*response_pitch - *pitch0);
+        best_yaw_error = std::min(best_yaw_error, yaw_error);
+        best_pitch_error = std::min(best_pitch_error, pitch_error);
+        max_yaw_motion = std::max(max_yaw_motion, yaw_motion);
+        max_pitch_motion = std::max(max_pitch_motion, pitch_motion);
+        if (
+          yaw_error <= 0.75 && pitch_error <= 0.75 && yaw_motion >= 1.5 &&
+          pitch_motion >= 0.75) {
+          responded = true;
+          passed_attempt = attempt;
           break;
         }
-      } else {
-        consecutive_restore_samples = 0;
       }
+
+      // The probe is deliberately non-firing and restores each attempt's entry
+      // pose before retrying or allowing normal control to continue. Reversing
+      // a physical turret must first bleed commanded-direction momentum, so
+      // require consecutive settled samples at the entry pose.
+      const auto restore_deadline = std::chrono::steady_clock::now() + 5s;
+      restored = false;
+      int consecutive_restore_samples = 0;
+      while (std::chrono::steady_clock::now() < restore_deadline) {
+        link.exec(fmt::format("UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, *yaw0, *pitch0));
+        std::this_thread::sleep_for(100ms);
+        restore_yaw = link.attr(sentry, ga::kTurretYaw);
+        restore_pitch = link.attr(sentry, ga::kTurretPitch);
+        if (
+          restore_yaw && restore_pitch &&
+          angle_error_degrees(*restore_yaw, *yaw0) <= kRestoreToleranceDegrees &&
+          std::abs(*restore_pitch - *pitch0) <= kRestoreToleranceDegrees) {
+          if (++consecutive_restore_samples >= kRequiredRestoreSamples) {
+            restored = true;
+            break;
+          }
+        } else {
+          consecutive_restore_samples = 0;
+        }
+      }
+      if (responded || !restored) break;
+      tools::logger()->warn(
+        "[gestalt] {} takeover response attempt {}/{} did not reach target; retrying "
+        "after physical settle",
+        phase, attempt, kResponseAttempts);
+      std::this_thread::sleep_for(1s);
     }
+
     if (!responded || !restored) {
       tools::logger()->error(
         "[gestalt] {} takeover gate failed: RBExtAim response={} pose_restore={} map={} "
-        "restore_yaw={:.2f} yaw_error={:.2f} restore_pitch={:.2f} pitch_error={:.2f}",
-        phase, responded, restored, sentry, restore_yaw.value_or(0.0),
-        restore_yaw ? angle_error_degrees(*restore_yaw, *yaw0) : -1.0,
+        "response_yaw={:.2f} best_yaw_error={:.2f} yaw_motion={:.2f} "
+        "response_pitch={:.2f} best_pitch_error={:.2f} pitch_motion={:.2f} "
+        "restore_yaw={:.2f} restore_yaw_error={:.2f} restore_pitch={:.2f} "
+        "restore_pitch_error={:.2f}",
+        phase, responded, restored, sentry, response_yaw.value_or(0.0), best_yaw_error,
+        max_yaw_motion, response_pitch.value_or(0.0), best_pitch_error, max_pitch_motion,
+        restore_yaw.value_or(0.0),
+        restore_yaw && yaw0 ? angle_error_degrees(*restore_yaw, *yaw0) : -1.0,
         restore_pitch.value_or(0.0),
-        restore_pitch ? std::abs(*restore_pitch - *pitch0) : -1.0);
+        restore_pitch && pitch0 ? std::abs(*restore_pitch - *pitch0) : -1.0);
       return false;
     }
     tools::logger()->info(
-      "[gestalt] {} takeover gate passed: mode90 + frame contract + RBExtAim response", phase);
+      "[gestalt] {} takeover gate passed: mode90 + frame contract + physically-ready "
+      "RBExtAim response (attempt {})",
+      phase, passed_attempt);
     return true;
   };
 
@@ -605,10 +673,12 @@ int main(int argc, char ** argv)
     // sequence can immediately re-acquire mode 90.
     claim_heartbeat.pause();
     const auto pid_map = link.find_player(ext_pid);
+    const auto pid_health = pid_map ? link.attr(*pid_map, ga::kHealth) : std::nullopt;
     const int release_map = pid_map.value_or(-1);
     const bool terminal_inactive =
       bench_match && terminal_inactive_release_allowed &&
-      link.attr(sentry, ga::kHealth).value_or(0) <= 0;
+      link.attr(sentry, ga::kHealth).value_or(0) <= 0 &&
+      (!pid_map || (pid_health && *pid_health <= 0));
     const bool expected_map = terminal_inactive || (pid_map && *pid_map == sentry);
     const bool expected_identity =
       !bench_match || terminal_inactive || (pid_map && is_expected_match_sentry(*pid_map));
@@ -630,7 +700,7 @@ int main(int argc, char ** argv)
       !bench_match || terminal_inactive ||
       (observed_release_map > 0 && is_expected_match_sentry(observed_release_map));
     // With no live target at natural settlement, explicit claim/release was
-    // sent and the heartbeat has remained stopped for the complete 5s lease
+    // sent and the heartbeat has remained stopped throughout the 5s validation
     // window above. A recycled map may retain stale mode=90 in this client's
     // cache, but it is no longer a controllable object.
     const bool restored = observed_mode_restore || terminal_inactive;
@@ -1323,15 +1393,17 @@ int main(int argc, char ** argv)
       release_fire();
       if (!bench_match) break;
       // Match takeover: our sentry died — it revives (buy-revive/auto), so
-      // re-acquire the new combat map and keep the claim for the next life.
+      // re-acquire the revived combat map and claim it for the next life.
       lives_lost++;
       dealt_carry += std::max(0.0, last_dealt - dealt_base);
       fired_carry = fired;
       current_life_accounted = true;
-      // A dead pawn is no longer externally controlled. Stop renewing so the
-      // game-side five-second lease restores its saved strategy mode while we
-      // wait (which may take minutes) for the game-owned revive.
+      // A dead pawn is no longer externally controlled. Stop renewing and
+      // release explicitly so the game restores its saved strategy mode
+      // without reporting the five-second safety lease as an expired claim
+      // while we wait (which may take minutes) for the game-owned revive.
       claim_heartbeat.pause();
+      link.exec(fmt::format("ExtAimClaim {} 0", ext_pid));
       tools::logger()->info(
         "[gestalt] own sentry down (life {} lost, dealt so far {:.0f}) — waiting for revive",
         lives_lost, dealt_carry);
@@ -1343,10 +1415,9 @@ int main(int argc, char ** argv)
       int new_map = -1;
       bool match_over = false;
       bool revive_identity_failed = false;
-      while (!ui_quit) {
+      while (!ui_quit && std::chrono::steady_clock::now() < t_end) {
         const double waited =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - t_dead0).count();
-        if (waited > 180.0) break;
         const bool death_ws_connected = link.connected();
         const auto death_ws_generation = link.connection_generation();
         if (!death_ws_connected || death_ws_generation != ws_generation) {
@@ -1360,7 +1431,12 @@ int main(int argc, char ** argv)
           break;
         }
         auto cur = link.find_player(0);
-        if (cur && *cur > dead_map && link.attr(*cur, ga::kHealth).value_or(0) > 0) {
+        // Game-owned revive has two valid forms: reconstruct a newer combat
+        // map, or revive the same pawn/map in place. hp_seen already proved
+        // this life reached zero, so HP>0 is a real post-death transition and
+        // accepting the same map cannot mistake the old live snapshot for a
+        // revive.
+        if (cur && *cur >= dead_map && link.attr(*cur, ga::kHealth).value_or(0) > 0) {
           if (!is_expected_match_sentry(*cur)) {
             identity_contract_ok = false;
             revive_identity_failed = true;
@@ -1402,10 +1478,11 @@ int main(int argc, char ** argv)
       hp_seen = false;
       hp_prev = -1;
       scan_active = false;
-      // The pawn is NEW: renew the claim, then re-assert the view AND camera
+      // The pawn is revived (possibly in place): renew the claim, then
+      // re-assert the view AND camera
       // rig. ExtAimClaim performs the mode-90 transition while preserving the
-      // new pawn's prior mode for release. The fresh pawn reverts to the
-      // chassis preset
+      // revived pawn's prior mode for release. A reconstructed pawn reverts to
+      // the chassis preset
       // (Tower 400cm boom + FOV 90), which silently breaks the fov-25
       // intrinsics and gun-socket extrinsics for every life after the first
       // (observed: damage_dealt 377 → 15 across otherwise identical matches).
