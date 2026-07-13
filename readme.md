@@ -70,7 +70,7 @@ powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSe
 
 ### 实战整局接管（gestalt_match_sentry.yaml）
 
-`bench_match: true` 走"赛前接管"编排：prep 阶段手动生成 HACHISEN 哨兵（`66000005`，SKM_Sentry 底盘）→ mode90+ExtAimClaim+RBTakeOver 认领 → 布相机/帧桥 → 自己发 `SetMatchStatus 1` 开赛——**比赛第 0 秒即外控**。底盘导航与补给经济全留给内置 AI；阵亡后复活交给游戏逻辑，桥只显示复活进度并在复活后重挂视角。丢锁 >2s 时云台 60°/s 巡扫（有原始检测即冻结让 tracker 收敛）。
+`bench_match: true` 走"赛前接管"编排：prep 阶段手动生成 HACHISEN 哨兵（`66000005`，SKM_Sentry 底盘）→ mode90+ExtAimClaim+RBTakeOver 认领 → 布相机/帧桥 → 自己发 `SetMatchStatus 1` 开赛——**比赛第 0 秒即外控**。底盘导航与补给经济全留给内置 AI；阵亡后复活交给游戏逻辑，桥只显示复活进度并在复活后重挂视角。丢锁 >2s 时云台巡扫：yaw 60°/s 整圈旋转 + pitch ±15° 三角波（周期非整数比→螺旋覆盖不同仰角带，纯水平扫会漏枪线下方近距目标），有原始检测即两轴冻结让 tracker 收敛。
 
 ```powershell
 powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSeconds 900 -MapId 4 -ResX 1280 -ResY 720

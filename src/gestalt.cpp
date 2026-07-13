@@ -7,6 +7,7 @@
 //
 // Usage: gestalt.exe <ws_port> [config] [--setup 1] [--fire 1]
 //        [--timeout 800]
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -717,9 +718,15 @@ int main(int argc, char ** argv)
 
   io::Command last_cmd{false, false, 0, 0};
   // Match-mode idle scan: sweep the turret when the aimer has produced no
-  // solution for a while, freezing whenever raw detections appear.
-  constexpr double kScanAfterLostSec = 2.0, kScanRateDegS = 60.0, kScanPitchDeg = 0.0;
-  double scan_yaw_deg = 0.0;
+  // solution for a while, freezing whenever raw detections appear. Yaw spins
+  // full circles while pitch rides a ±15° triangle wave — low targets under
+  // the muzzle line are invisible to a level-only sweep. The two periods are
+  // deliberately non-integer-ratio (yaw rev 6s vs pitch leg ~8.6s) so
+  // successive revolutions cover different elevation bands (spiral coverage).
+  constexpr double kScanAfterLostSec = 2.0, kScanRateDegS = 60.0;
+  constexpr double kScanPitchMaxDeg = 15.0, kScanPitchRateDegS = 3.5;
+  double scan_yaw_deg = 0.0, scan_pitch_deg = 0.0;
+  int scan_pitch_dir = -1;  // start by looking down: close targets hide there
   bool scan_active = false;
   auto t_last_ctrl = std::chrono::steady_clock::now();
   int frames = 0, det_frames = 0, cmds = 0, fire_cmds = 0, grab_fail = 0;
@@ -1555,13 +1562,26 @@ int main(int argc, char ** argv)
       if (lost_s > kScanAfterLostSec) {
         if (!scan_active) {
           scan_yaw_deg = link.attr(sentry, ga::kTurretYaw).value_or(0.0);
+          scan_pitch_deg = std::clamp(link.attr(sentry, ga::kTurretPitch).value_or(0.0),
+                                      -kScanPitchMaxDeg, kScanPitchMaxDeg);
           scan_active = true;
         }
-        if (armors.empty()) scan_yaw_deg += kScanRateDegS / 30.0;  // ~per-frame at 30fps
+        if (armors.empty()) {  // ~per-frame steps at 30fps; hold both axes on detections
+          scan_yaw_deg += kScanRateDegS / 30.0;
+          scan_pitch_deg += scan_pitch_dir * kScanPitchRateDegS / 30.0;
+          if (scan_pitch_deg >= kScanPitchMaxDeg) {
+            scan_pitch_deg = kScanPitchMaxDeg;
+            scan_pitch_dir = -1;
+          } else if (scan_pitch_deg <= -kScanPitchMaxDeg) {
+            scan_pitch_deg = -kScanPitchMaxDeg;
+            scan_pitch_dir = 1;
+          }
+        }
         scan_yaw_deg = std::remainder(scan_yaw_deg, 360.0);
         link.exec(fmt::format(
-          "UEExec RBExtAim {} {:.1f} {:.1f} 0 {:.0f}", ext_pid, scan_yaw_deg, kScanPitchDeg,
-          armors.empty() ? kScanRateDegS : 0.0));
+          "UEExec RBExtAim {} {:.1f} {:.1f} 0 {:.0f} {:.0f}", ext_pid, scan_yaw_deg,
+          scan_pitch_deg, armors.empty() ? kScanRateDegS : 0.0,
+          armors.empty() ? scan_pitch_dir * kScanPitchRateDegS : 0.0));
         cmds++;
       }
     }

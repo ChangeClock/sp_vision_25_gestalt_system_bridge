@@ -10,8 +10,10 @@
 # The bridge claims pid 0 via ExtAimClaim (per-tick AITargetMode=90 rewrite),
 # views through its first-person gun (RBTakeOver 0 — a roster pawn's camera
 # comes up in TPS and breaks the fov-25 intrinsics), and adds an idle scan:
-# after 2s without a fire solution the turret sweeps at 60°/s, freezing while
-# raw detections are present so the tracker can lock. On death: revival is the
+# after 2s without a fire solution the turret spins yaw at 60°/s while pitch
+# rides a ±15° triangle wave (spiral coverage — low targets under the muzzle
+# line are invisible to a level-only sweep), freezing both axes while raw
+# detections are present so the tracker can lock. On death: revival is the
 # game's own business — the bridge only shows the live revive progress and
 # re-asserts claim + gun view once the game brings the sentry back. Exit on
 # match end / timeout.
