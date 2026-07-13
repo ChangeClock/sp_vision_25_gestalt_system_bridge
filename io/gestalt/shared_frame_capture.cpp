@@ -1,20 +1,25 @@
 #include "shared_frame_capture.hpp"
 
+#include <winsock2.h>
 #include <windows.h>
+#include <iphlpapi.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <thread>
 #include <vector>
+
+#pragma comment(lib, "iphlpapi.lib")
 
 namespace io::gestalt
 {
 namespace
 {
 constexpr uint64_t kMagic = 0x314D52464E565347ull;
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 3;
 constexpr uint32_t kRegionHeaderBytes = 4096;
 constexpr uint32_t kSlotHeaderBytes = 256;
 
@@ -59,29 +64,33 @@ struct alignas(64) SlotHeader
   uint32_t row_bytes;
   uint32_t pixel_bytes;
   uint32_t pixel_format;
-  uint32_t reserved0;
-  uint8_t reserved[kSlotHeaderBytes - 112];
+  float camera_arm_length_cm;
+  uint32_t view_actor_unique_id;
+  uint32_t takeover_target_unique_id;
+  int32_t takeover_player_id;
+  int32_t takeover_attribute_map_id;
+  uint32_t takeover_epoch;
+  uint32_t identity_flags;
+  uint8_t reserved[132];
 };
 static_assert(sizeof(SlotHeader) == kSlotHeaderBytes);
+static_assert(offsetof(SlotHeader, camera_arm_length_cm) == 96);
+static_assert(offsetof(SlotHeader, view_actor_unique_id) == 100);
+static_assert(offsetof(SlotHeader, takeover_target_unique_id) == 104);
+static_assert(offsetof(SlotHeader, takeover_player_id) == 108);
+static_assert(offsetof(SlotHeader, takeover_attribute_map_id) == 112);
+static_assert(offsetof(SlotHeader, takeover_epoch) == 116);
+static_assert(offsetof(SlotHeader, identity_flags) == 120);
 
 struct FoundWindow
 {
   HWND hwnd = nullptr;
   DWORD pid = 0;
   std::string title;
-  bool has_frame_mapping = false;
+  int64_t client_area = -1;
 };
 
 std::wstring mapping_name(DWORD pid);
-
-bool frame_mapping_exists(DWORD pid)
-{
-  const auto name = mapping_name(pid);
-  HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
-  if (!mapping) return false;
-  CloseHandle(mapping);
-  return true;
-}
 
 std::string exe_of_pid(DWORD pid)
 {
@@ -108,6 +117,7 @@ BOOL CALLBACK enum_window(HWND hwnd, LPARAM parameter)
   if (!GetWindowTextA(hwnd, title, sizeof(title)) || !title[0]) return TRUE;
   DWORD pid = 0;
   GetWindowThreadProcessId(hwnd, &pid);
+  if (found->pid != 0 && pid != found->pid) return TRUE;
   // The bridge executable is also named gestalt.exe. A visible console/debug
   // window owned by this process must never be mistaken for the game viewport.
   if (pid == GetCurrentProcessId()) return TRUE;
@@ -115,30 +125,62 @@ BOOL CALLBACK enum_window(HWND hwnd, LPARAM parameter)
   if (executable.rfind("unrealeditor", 0) != 0 && executable.rfind("gestalt", 0) != 0 &&
       executable.rfind("robotbridge", 0) != 0)
     return TRUE;
-  // Multiple UE projects may be open on a development machine.  Process name
-  // and window visibility are not sufficient to identify the game that owns
-  // this bridge; prefer the process that actually publishes a VisionBridge
-  // shared-memory ring.  Keep the first eligible window only as a startup
-  // fallback while its mapping is being created.
-  const bool has_frame_mapping = frame_mapping_exists(pid);
-  if (found->hwnd && !has_frame_mapping) return TRUE;
+  // The WS listener already selected the process. Pick its actual viewport,
+  // not an auxiliary console/debug HWND owned by that same process.
+  RECT client{};
+  GetClientRect(hwnd, &client);
+  const int64_t client_area =
+    static_cast<int64_t>(std::max(0L, client.right - client.left)) *
+    static_cast<int64_t>(std::max(0L, client.bottom - client.top));
+  // A process can own a console/debug top-level window as well as the game
+  // viewport. The mapping is process-scoped, so prefer its largest client
+  // window instead of stopping at whichever HWND EnumWindows returns first.
+  if (found->hwnd && client_area <= found->client_area) return TRUE;
   // A minimized UE viewport legitimately reports a 0x0 client rect. Process
   // identity is authoritative here; init/raise_window restores it before the
   // first frame is consumed.
   found->hwnd = hwnd;
   found->pid = pid;
   found->title = title;
-  found->has_frame_mapping = has_frame_mapping;
-  // A publisher is authoritative; do not let another unrelated UnrealEditor
-  // window encountered later overwrite it.
-  return has_frame_mapping ? FALSE : TRUE;
+  found->client_area = client_area;
+  return TRUE;
 }
 
-FoundWindow find_game_window()
+FoundWindow find_game_window(DWORD expected_pid)
 {
   FoundWindow found;
+  found.pid = expected_pid;
   EnumWindows(enum_window, reinterpret_cast<LPARAM>(&found));
   return found;
+}
+
+DWORD listener_pid_for_port(int port)
+{
+  if (port <= 0 || port > 65535) return 0;
+  ULONG bytes = 0;
+  if (
+    GetExtendedTcpTable(
+      nullptr, &bytes, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) !=
+      ERROR_INSUFFICIENT_BUFFER ||
+    bytes == 0)
+    return 0;
+  std::vector<uint8_t> storage(bytes);
+  auto * table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID *>(storage.data());
+  if (
+    GetExtendedTcpTable(
+      table, &bytes, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR)
+    return 0;
+  for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+    const auto & row = table->table[i];
+    if (ntohs(static_cast<u_short>(row.dwLocalPort)) != port) continue;
+    // The release contract requires loopback. Accept INADDR_ANY here only so
+    // Development builds remain diagnosable; Shipping's command gate still
+    // fails closed unless -wsbind=127.0.0.1 is in effect.
+    if (row.dwLocalAddr != htonl(INADDR_LOOPBACK) && row.dwLocalAddr != htonl(INADDR_ANY))
+      continue;
+    return row.dwOwningPid;
+  }
+  return 0;
 }
 
 std::wstring mapping_name(DWORD pid)
@@ -179,12 +221,20 @@ SharedFrameCapture::~SharedFrameCapture()
   delete impl_;
 }
 
-bool SharedFrameCapture::init(int timeout_ms)
+bool SharedFrameCapture::init(int ws_port, int timeout_ms)
 {
   impl_->close();
-  const auto found = find_game_window();
+  const DWORD listener_pid = listener_pid_for_port(ws_port);
+  if (!listener_pid) {
+    std::fprintf(
+      stderr, "[SharedFrameCapture] no IPv4 listener process found for WS port %d\n", ws_port);
+    return false;
+  }
+  const auto found = find_game_window(listener_pid);
   if (!found.hwnd) {
-    std::fprintf(stderr, "[SharedFrameCapture] no eligible game viewport found\n");
+    std::fprintf(
+      stderr, "[SharedFrameCapture] WS pid=%lu has no eligible game viewport\n",
+      static_cast<unsigned long>(listener_pid));
     return false;
   }
   impl_->hwnd = found.hwnd;
@@ -307,10 +357,18 @@ CapturedFrame SharedFrameCapture::grab(int timeout_ms)
     height_ = static_cast<int>(metadata.height);
     out.t_present = qpc_seconds(metadata.capture_qpc, impl_->region->qpc_frequency);
     out.frame_id = metadata.engine_frame_counter;
+    out.writer_process_id = static_cast<uint32_t>(impl_->region->writer_process_id);
     for (int i = 0; i < 3; ++i) out.camera_position_ue_cm[i] = metadata.camera_position_cm[i];
     for (int i = 0; i < 4; ++i)
       out.camera_quaternion_ue_xyzw[i] = metadata.camera_quaternion_xyzw[i];
     out.fov_degrees = metadata.horizontal_fov_degrees;
+    out.camera_arm_length_cm = metadata.camera_arm_length_cm;
+    out.view_actor_unique_id = metadata.view_actor_unique_id;
+    out.takeover_target_unique_id = metadata.takeover_target_unique_id;
+    out.takeover_player_id = metadata.takeover_player_id;
+    out.takeover_attribute_map_id = metadata.takeover_attribute_map_id;
+    out.takeover_epoch = metadata.takeover_epoch;
+    out.identity_flags = metadata.identity_flags;
     out.has_camera_pose = true;
     out.ok = true;
     last_commit_ = best_commit;

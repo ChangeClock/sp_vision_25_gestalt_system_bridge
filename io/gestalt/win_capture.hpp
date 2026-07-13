@@ -19,9 +19,17 @@ struct CapturedFrame
   cv::Mat img;              // BGR, cropped to game client rect minus footer
   double t_present = 0.0;   // seconds, steady/QPC clock, at DXGI present
   uint64_t frame_id = 0;
+  uint32_t writer_process_id = 0;
   std::array<double, 3> camera_position_ue_cm{};
   std::array<double, 4> camera_quaternion_ue_xyzw{};
   double fov_degrees = 0.0;
+  double camera_arm_length_cm = 0.0;
+  uint32_t view_actor_unique_id = 0;
+  uint32_t takeover_target_unique_id = 0;
+  int32_t takeover_player_id = -1;
+  int32_t takeover_attribute_map_id = -1;
+  uint32_t takeover_epoch = 0;
+  uint32_t identity_flags = 0;
   bool has_camera_pose = false;
   bool ok = false;
 };

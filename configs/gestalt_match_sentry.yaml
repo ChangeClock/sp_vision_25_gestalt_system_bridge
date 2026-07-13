@@ -7,16 +7,25 @@
 #       -MatchObserveSeconds 900 -MapId 4 -ResX 1280 -ResY 720
 #   .\build\Release\gestalt.exe <ws-port> configs\gestalt_match_sentry.yaml --timeout=600
 #
-# The bridge claims pid 0 via ExtAimClaim (per-tick AITargetMode=90 rewrite),
+# The bridge constructs/compiles and infer-warms the detector + solver before
+# touching match state, then claims pid 0 via ExtAimClaim (atomic old-mode save + mode90).
+# A dedicated thread renews the lease every second while that pawn is alive, so
+# inference/model/capture waits cannot outrun the five-second game-side lease.
 # views through its first-person gun (RBTakeOver 0 — a roster pawn's camera
 # comes up in TPS and breaks the fov-25 intrinsics), and adds an idle scan:
 # after 2s without a fire solution the turret spins yaw at 60°/s while pitch
 # rides a ±15° triangle wave (spiral coverage — low targets under the muzzle
 # line are invisible to a level-only sweep), freezing both axes while raw
-# detections are present so the tracker can lock. On death: revival is the
+# detections are present so the tracker can lock; the freeze target is the
+# current telemetry pose, never the previous scan target. On death: heartbeat
+# renewal stops and revival is the
 # game's own business — the bridge only shows the live revive progress and
-# re-asserts claim + gun view once the game brings the sentry back. Exit on
-# match end / timeout.
+# re-asserts claim + gun view once the game brings a strictly newer map back,
+# then repeats identity + mode/frame/FOV/armLength/RBExtAim effect gates. WS or
+# capture recovery likewise requires claim + takeover + camera + the full gate;
+# otherwise the run fails safely. Pixel capture is pinned to the process that
+# owns the requested WS listener port, so another UE publisher cannot be mixed
+# into this control session. Exit on match end / timeout.
 
 enemy_color: "blue"                # red sentry shoots BLUE targets
 
@@ -74,6 +83,8 @@ R_camera2gimbal:  [0, 0, 1, -1, 0, 0, 0, -1, 0]
 t_camera2gimbal:  [0, 0, 0]
 
 #####----- camera intrinsics (ideal UE pinhole, FOV_h=25 @ 1280x720) -----#####
+frame_width: 1280
+frame_height: 720
 camera_matrix: [2886.9, 0, 640.0, 0, 2886.9, 360.0, 0, 0, 1]
 distort_coeffs: [0, 0, 0, 0, 0]
 sim_quad_scale: 1.192

@@ -25,6 +25,7 @@ namespace attr
 {
 constexpr int kPlayerId = 10000035;
 constexpr int kTeamId = 10000036;
+constexpr int kConnectionEntityConfigId = 10000064;
 constexpr int kClass = 60000002;
 constexpr int kPosX = 10000107, kPosY = 10000108, kPosZ = 10000109;
 constexpr int kChassisYaw = 10000110;
@@ -51,7 +52,14 @@ public:
   GameLink(const GameLink &) = delete;
   GameLink & operator=(const GameLink &) = delete;
 
-  bool connected() const { return connected_.load(); }
+  bool connected() const { return connected_.load(std::memory_order_acquire); }
+  // Monotonically increases after every successful WebSocket connection.
+  // A caller can therefore distinguish a brief disconnect/reconnect from an
+  // uninterrupted session even when it never samples connected()==false.
+  uint64_t connection_generation() const
+  {
+    return connection_generation_.load(std::memory_order_acquire);
+  }
 
   // Latest cached attribute value (numeric attrs only). nullopt if unseen.
   std::optional<double> attr(int map_id, int attr_id) const;
@@ -83,6 +91,10 @@ public:
   // never be inferred from class filters.
   std::optional<int> find_player(int player_id) const;
 
+  // Entity config selected for a player (for example pid 0 -> 66000005 for
+  // HACHISEN). This lives on the player attribute map, not the combat map.
+  std::optional<int> player_entity_config(int player_id) const;
+
   // Map id of the red outpost (global var kOutpostRedGlobal, fallback: the
   // 1500-HP building map without a player id).
   std::optional<int> find_red_outpost() const;
@@ -104,12 +116,17 @@ private:
 
   int port_;
   std::atomic<bool> stop_{false}, connected_{false};
+  std::atomic<uint64_t> connection_generation_{0};
   std::atomic<int> pose_map_{-1};
-  mutable std::mutex mu_;                     // guards maps_/watched_/ws send/pose_hist_
+  mutable std::mutex mu_;                     // guards maps_/watched_/pose_hist_
+  mutable std::mutex ws_mu_;                  // serializes easywsclient poll/dispatch/send
   std::deque<PoseSample> pose_hist_;
   std::map<int, std::map<int, double>> maps_; // map_id -> attr_id -> value
   std::set<int> watched_;
-  int next_id_ = 990001;
+  // Requests are emitted by both the main/control thread and reader-thread
+  // discovery path. Keep ids unique without relying on the websocket mutex:
+  // JSON is assembled before send_raw() takes that lock.
+  std::atomic<int> next_id_{990001};
   void * ws_ = nullptr;  // easywsclient::WebSocket*
   std::thread reader_;
 };

@@ -20,9 +20,10 @@ public:
   SharedFrameCapture(const SharedFrameCapture &) = delete;
   SharedFrameCapture & operator=(const SharedFrameCapture &) = delete;
 
-  // Finds the game window, derives its process-scoped local mapping name, and
-  // waits for r.VisionBridge.Enable=1 to create the stream.
-  bool init(int timeout_ms = 10000);
+  // Resolves the process listening on the loopback WebSocket port, finds that
+  // exact process' game window, and opens only its process-scoped mapping.
+  // This prevents a second UE publisher from stealing the pixel data plane.
+  bool init(int ws_port, int timeout_ms = 10000);
   CapturedFrame grab(int timeout_ms = 100);
   void raise_window();
 

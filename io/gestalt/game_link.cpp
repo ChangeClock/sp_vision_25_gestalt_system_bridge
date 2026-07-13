@@ -41,7 +41,7 @@ GameLink::~GameLink()
 {
   stop_ = true;
   if (reader_.joinable()) reader_.join();
-  std::lock_guard<std::mutex> lk(mu_);
+  std::lock_guard<std::mutex> lk(ws_mu_);
   if (ws_) {
     static_cast<WebSocket *>(ws_)->close();
     delete static_cast<WebSocket *>(ws_);
@@ -56,16 +56,27 @@ bool GameLink::connect_once()
   WebSocket * ws = WebSocket::from_url(url);
   if (!ws) return false;
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(ws_mu_);
     if (ws_) delete static_cast<WebSocket *>(ws_);
     ws_ = ws;
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    // Never let a reconnect look healthy through frozen values from the old
+    // socket. The initial sweep and pointer discovery below repopulate this
+    // cache before the control loop is allowed to re-arm.
+    maps_.clear();
+    pose_hist_.clear();
     watched_.clear();
   }
   // Initial sweep: maps 1..256; ptr attrs then auto-discover vehicle maps.
   std::vector<int> initial;
   for (int i = 1; i <= 256; ++i) initial.push_back(i);
   watch(initial);
-  connected_ = true;
+  connection_generation_.fetch_add(1, std::memory_order_release);
+  // Publish connected last: a consumer that observes true with acquire must
+  // also observe the new generation and the cleared/reseeded telemetry state.
+  connected_.store(true, std::memory_order_release);
   std::printf("[GameLink] connected %s\n", url);
   return true;
 }
@@ -79,31 +90,33 @@ void GameLink::reader_loop()
         continue;
       }
     }
-    WebSocket * ws;
+    std::vector<int> discovered;
+    std::vector<std::string> incoming;
+    bool socket_closed = false;
     {
-      std::lock_guard<std::mutex> lk(mu_);
-      ws = static_cast<WebSocket *>(ws_);
+      // easywsclient is not thread-safe. Keep poll/dispatch/send serialized,
+      // but dispatch only copies raw messages here; JSON and attribute-cache
+      // work happens after releasing ws_mu_ so a one-second claim renewal can
+      // never queue behind a large initial telemetry sweep.
+      std::lock_guard<std::mutex> ws_lock(ws_mu_);
+      auto * ws = static_cast<WebSocket *>(ws_);
+      if (!ws || ws->getReadyState() == WebSocket::CLOSED) {
+        socket_closed = true;
+      } else {
+        ws->poll(1);
+        ws->dispatch([&](const std::string & raw) { incoming.push_back(raw); });
+      }
     }
-    if (!ws || ws->getReadyState() == WebSocket::CLOSED) {
+    if (socket_closed) {
       connected_ = false;
       continue;
     }
-    {
-      // easywsclient is not thread-safe: poll() flushes the tx buffer that
-      // send() (via send_raw, same mutex) appends to — keep them serialized.
-      // poll(1), NOT poll(5): the vision loop reads ~8 attrs per frame under
-      // this same mutex; a 5ms hold starves it into ~130ms frame periods.
-      std::lock_guard<std::mutex> lk(mu_);
-      ws->poll(1);
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));  // yield to attr readers
-    std::vector<int> discovered;
-    ws->dispatch([&](const std::string & raw) {
+    for (const auto & raw : incoming) {
       json p = json::parse(raw, nullptr, /*allow_exceptions=*/false);
-      if (p.is_discarded() || p.value("type", -1) != 0) return;
-      if (p.value("method", "") != "watchAttributeMaps.result") return;
+      if (p.is_discarded() || p.value("type", -1) != 0) continue;
+      if (p.value("method", "") != "watchAttributeMaps.result") continue;
       auto results = p["params"]["watch_attribute_maps_results"];
-      if (!results.is_array()) return;
+      if (!results.is_array()) continue;
       std::lock_guard<std::mutex> lk(mu_);
       const int pose_map = pose_map_.load();
       for (auto & r : results) {
@@ -119,6 +132,12 @@ void GameLink::reader_loop()
           double v = it.value().get<double>();
           m[aid] = v;
           if (aid == attr::kMapPtr && v > 0) discovered.push_back(static_cast<int>(v));
+          // The global map stores player-id -> player-attribute-map pointers
+          // in the reserved [0, PlayerID_MAX) id range. Follow those pointers
+          // so ConnectionEntityConfigId can be verified independently of the
+          // combat map's career/team attributes.
+          if (aid >= 0 && aid < 100000 && v > 0)
+            discovered.push_back(static_cast<int>(v));
           if (mid == pose_map && (aid == attr::kTurretYaw || aid == attr::kTurretPitch))
             pose_touched = true;
         }
@@ -126,15 +145,16 @@ void GameLink::reader_loop()
           auto y = m.find(attr::kTurretYaw);
           auto p = m.find(attr::kTurretPitch);
           if (y != m.end() && p != m.end()) {
-            double now_s =
-              std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
-                .count();
+            double now_s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
             pose_hist_.push_back({now_s, y->second, p->second});
             if (pose_hist_.size() > 64) pose_hist_.pop_front();
           }
         }
       }
-    });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (!discovered.empty()) watch(discovered);
   }
 }
@@ -149,7 +169,7 @@ void GameLink::watch(const std::vector<int> & ids)
   }
   if (fresh.empty()) return;
   json msg = {{"type", 0},
-              {"id", ++next_id_},
+              {"id", next_id_.fetch_add(1, std::memory_order_relaxed) + 1},
               {"method", "attribute.watchAttributeMaps"},
               {"params", {{"attribute_map_ids", fresh}, {"watch_type", 2}}}};
   send_raw(msg.dump());
@@ -157,7 +177,7 @@ void GameLink::watch(const std::vector<int> & ids)
 
 void GameLink::send_raw(const std::string & payload)
 {
-  std::lock_guard<std::mutex> lk(mu_);
+  std::lock_guard<std::mutex> lk(ws_mu_);
   auto * ws = static_cast<WebSocket *>(ws_);
   if (ws && ws->getReadyState() == WebSocket::OPEN) ws->send(payload);
 }
@@ -165,7 +185,7 @@ void GameLink::send_raw(const std::string & payload)
 void GameLink::exec(const std::string & command)
 {
   json msg = {{"type", 0},
-              {"id", ++next_id_},
+              {"id", next_id_.fetch_add(1, std::memory_order_relaxed) + 1},
               {"method", "console.exec"},
               {"params", {{"command", command}}}};
   send_raw(msg.dump());
@@ -176,7 +196,7 @@ void GameLink::apply_camera(const std::string & camera_json)
   json cam = json::parse(camera_json, nullptr, false);
   if (cam.is_discarded()) return;
   json msg = {{"type", 0},
-              {"id", ++next_id_},
+              {"id", next_id_.fetch_add(1, std::memory_order_relaxed) + 1},
               {"method", "rgbCamera.applySettings"},
               {"params", {{"camera", cam}}}};
   send_raw(msg.dump());
@@ -254,6 +274,30 @@ std::optional<int> GameLink::find_vehicle(int cls, int team) const
 std::optional<int> GameLink::find_player(int player_id) const
 {
   std::lock_guard<std::mutex> lk(mu_);
+  // Authoritative chain:
+  //   global[player id] -> player attribute map
+  //   player map[kMapPtr] -> current battle/combat map
+  // Respawn leaves older combat maps cached (sometimes with frozen HP>0), so
+  // the highest alive map is not a safe definition of the player's current
+  // pawn during death/final teardown.
+  for (const auto & [global_id, global_or_other] : maps_) {
+    const auto player_pointer = global_or_other.find(player_id);
+    if (player_pointer == global_or_other.end() || player_pointer->second <= 0) continue;
+    const auto player_map = maps_.find(static_cast<int>(player_pointer->second));
+    if (player_map == maps_.end()) continue;
+    const auto battle_pointer = player_map->second.find(attr::kMapPtr);
+    if (battle_pointer == player_map->second.end() || battle_pointer->second <= 0) continue;
+    const int battle_map_id = static_cast<int>(battle_pointer->second);
+    const auto battle_map = maps_.find(battle_map_id);
+    if (battle_map == maps_.end()) continue;
+    const auto battle_player_id = battle_map->second.find(attr::kPlayerId);
+    if (battle_player_id != battle_map->second.end() &&
+        static_cast<int>(battle_player_id->second) == player_id)
+      return battle_map_id;
+  }
+
+  // Startup fallback while the two pointer hops are still landing. Once the
+  // player map arrives, the authoritative branch above always wins.
   std::optional<int> best_alive, fallback;
   for (const auto & [mid, m] : maps_) {
     const auto p = m.find(attr::kPlayerId);
@@ -265,6 +309,20 @@ std::optional<int> GameLink::find_player(int player_id) const
       fallback = mid;
   }
   return best_alive ? best_alive : fallback;
+}
+
+std::optional<int> GameLink::player_entity_config(int player_id) const
+{
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto & [mid, global_or_other] : maps_) {
+    const auto pointer = global_or_other.find(player_id);
+    if (pointer == global_or_other.end() || pointer->second <= 0) continue;
+    const auto player_map = maps_.find(static_cast<int>(pointer->second));
+    if (player_map == maps_.end()) continue;
+    const auto config = player_map->second.find(attr::kConnectionEntityConfigId);
+    if (config != player_map->second.end()) return static_cast<int>(config->second);
+  }
+  return std::nullopt;
 }
 
 std::optional<int> GameLink::find_red_outpost() const

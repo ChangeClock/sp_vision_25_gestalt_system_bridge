@@ -63,7 +63,7 @@ if(WIN32)
   target_link_libraries(gestalt
     ${OpenCV_LIBS} fmt::fmt spdlog::spdlog ${YAMLCPP_TARGET}
     openvino::runtime auto_aim tools
-    d3d11 dxgi ws2_32)
+    d3d11 dxgi ws2_32 iphlpapi)
   target_compile_options(gestalt PRIVATE /utf-8)
   target_compile_definitions(gestalt PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES)
 else()
