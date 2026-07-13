@@ -80,6 +80,86 @@ powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSe
 - **哨兵底盘的 Tower 相机预设自带 400cm 追尾吊臂**（`Camera.csv`），接管即第三人称且破坏枪口外参——camera_json 里 `"armLength":0` 收回吊臂（需配套的游戏侧 applySettings 键，2026-07-13 已落地）。
 - RESULT 增加 `damage_dealt=`（DamageAppliedTotal 差值，跨命累计）与 `lives_lost=`；match 模式下 hp 口径=自身存活，damaging_hits/hit_rate 无意义。
 - 2026-07-13 整局基线（红方 HACHISEN，~6.3min）：183 发、det 0.264、对敌伤害 377（≈8.5% 实战命中）、阵亡 4 次全部由游戏复活并自动续接，内置 AI 经济中途补弹至 700+。
+- **复活后必须重新 apply 相机**：新 pawn 会回落到构型默认（Tower 400cm 吊臂 + FOV90），内参/外参双错但检测仍有输出，症状极隐蔽（对照实验 damage_dealt 377→15）。桥的复活路径已内置重挂。
+
+### 附：gestalt 模拟器调用速查（WS / AutoStart，人类版）
+
+> 桥代码（`io/gestalt/`、`src/gestalt.cpp`）已封装以下全部通信；本节是给需要手工调试或写新工具的人的独立参考，不依赖 gestalt_system 仓库内部文档。
+
+**连接**：游戏每实例开一个 WebSocket（`ws://127.0.0.1:<port>/`），端口动态，读启动日志旁的 sidecar 文件 `Saved\ai-selftest\<log>.wsport`。消息为 JSON：`{"type":0,"id":<自增>,"method":"<方法>","params":{...}}`。
+
+**三个核心 WS 方法**：
+
+| 方法 | params | 说明 |
+|---|---|---|
+| `attribute.watchAttributeMaps` | `{"attribute_map_ids":[1..256,...],"watch_type":2}` | 订阅属性表推送（先订 1..256，再订推送中发现的新 map id）。位置 10Hz、云台角 30Hz、其余按变化推 |
+| `console.exec` | `{"command":"<TS 控制台命令>"}` | 执行下表任意命令；fire-and-forget |
+| `rgbCamera.applySettings` | `{"camera":{"enabled":1,"fovDegrees":25,"shutterSpeed":120,"iso":600,"armLength":0}}` | 视觉相机参数（合并语义：没写的键沿用上次）。`armLength:0` 收回哨兵底盘的 400cm Tower 吊臂 |
+
+**桥使用的属性 id**（`io/gestalt/game_link.hpp`；每车一张 map，`kMapPtr 1000001` 自动发现）：
+
+| id | 含义 | id | 含义 |
+|---|---|---|---|
+| 10000003 | Health | 10000035 | PlayerId |
+| 60000004 | HealthMax（先抬它再抬 HP，否则钳制） | 10000036 | TeamId（0红 1蓝） |
+| 10000033 | 17mm 弹量配额（=0 则 FiringLocked） | 60000002 | Class（哨兵 1004） |
+| 10000031 | 17mm 物理弹 | 10000107/108/109 | WorldPos X/Y/Z (cm) |
+| 63000002 | BulletFiredTotal（实际出膛累计，shot 计数正源） | 10000110/111/112 | ChassisYaw / TurretYaw / TurretPitch (deg) |
+| 63000000 | DamageAppliedTotal（对敌伤害累计，战果口径） | 10000030 | 每发实测炮口初速 (cm/s) |
+| 10000022 / 60000017 | ReviveProgress / Max（复活进度） | 80000005 | MatchStatus（-1 未知 0 prep 1 进行 2 结束） |
+| 50000088/89/90 | IsAIControlled / AIMoveMode / AITargetMode | 50000097 | AIMoveTargetMarkerId |
+
+**控制台命令**（经 `console.exec` 下发；原生 UE 命令须加 `UEExec ` 前缀）：
+
+| 命令 | 说明 |
+|---|---|
+| `Respawn <pid> <entity_id> <team>` | 生成/重生车辆。哨兵(HACHISEN)=66000005、步兵=66000002、突击步兵=66000008、英雄=66000001。异步，等新的更高 map id 且 hp>0（老尸体快照陷阱） |
+| `SetAttribute <pid> <attr_id> <value>` | 精确写单车属性（勿用 BatchSet 广播误伤同队） |
+| `ExtAimClaim <pid> <0\|1>` | 认领/交还外部瞄准：策略每 tick 后同周期回写 AITargetMode=90，内置自瞄抢不回 |
+| `UEExec RBExtAim <pid> <yaw°> <pitch°> [fire01] [yawVel°/s] [pitchVel°/s]` | 世界系绝对角瞄准+开火请求（开火仍过热量/弹量/CanOperate 全部原生门） |
+| `UEExec RBTakeOver <pid>` | 视口切到该车第一人称枪管视角（帧桥导出的就是视口） |
+| `UEExec RBNavGoto <pid> <x_cm> <y_cm> [z_cm]` / `RBNavLab goto ...` | 任意坐标导航（50cm 自动清；英雄级底盘停靠带 ~3m，判到达用 350cm） |
+| `RBNavLab spawn entity=<tok> team=<0\|1> tn=<n> pid=<9200x>` | 生成实验靶车（英雄必须 tn=1 否则贴图回落 logo 误分类） |
+| `RBNavLab mode <pid> 99 0` | 小陀螺（哨兵/步兵可转；英雄底盘无 fSpinSpeed 转不了）。mode 维护每 tick 重写，会压掉后发 goto——先 `mode <pid> 0 0` |
+| `BatchSet 72000001 <毫度/s> red outpost` | 前哨转速（0=冻结；默认 ±144°/s）。`BatchSet 10000003 100000 red outpost` 抬前哨 HP |
+| `SetMatchStatus 1` | 开赛（配合 -SkipMatchStart 实现"先接管后开赛"） |
+| `UEExec r.VisionBridge.Enable 1` | 开共享内存帧桥（像素+同帧相机位姿，SHM 按游戏 PID 命名） |
+| `UEExec r.AntiAliasingMethod 1` / `r.MotionBlurQuality 0` / `r.RobotNav.DebugDraw 0` / `t.MaxFPS 30` | 渲染四件套：FXAA 防拖影 / 关运动模糊 / 关导航调试线 / 限帧让 CPU 给检测器 |
+
+**AutoStart 语义**：`ai-match-selftest.ps1` 默认启动即开赛（AI 双方全启）；`-SkipMatchStart 1` 停在 prep 阶段（无比赛 AI、自动隐 HUD+静音、keep-alive `MatchObserveSeconds` 秒），由外部程序自行 `SetMatchStatus 1`。就绪判据：游戏日志出现 `[AutoStart] Game start result: success=true` 且 `.wsport` sidecar 已写出。全部外控命令 `!UE_BUILD_SHIPPING` 门控（编辑器/Development 可用，真 Shipping 不可用）。
+
+### 完整复现流程（从零到整局接管）
+
+```powershell
+# 0) 构建两侧（一次性）
+#    游戏侧（gestalt_system 仓库根）：
+powershell -File scripts/ue-build.ps1          # C++（需含 applySettings armLength 键）
+npx vite build --mode development              # TS bundle
+#    视觉侧（本仓库根，VS2022 x64；依赖路径见上文 Windows 构建说明）：
+cmake --build build --config Release --target gestalt
+
+# 1) gestalt.exe 运行依赖 DLL 上 PATH（缺了报 0xC0000135）
+$env:PATH = "<deps>\opencv\build\x64\vc16\bin;<python>\Lib\site-packages\openvino\libs;" + $env:PATH
+
+# 2) 启动游戏（prep 阶段保活 20 分钟）
+powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSeconds 1200 -MapId 4 -ResX 1280 -ResY 720
+$port = Get-Content "Saved\ai-selftest\<最新log>.wsport"
+
+# 3a) 三靶验收 bench（可选；前哨轮先抬 HP 保证 100 发打满）
+powershell -File scripts/rb-console-exec.ps1 -Command 'BatchSet 10000003 100000 red outpost' -LogPath <log绝对路径>
+.\build\Release\gestalt.exe $port configs\gestalt_sentry_outpost.yaml           --timeout=300
+.\build\Release\gestalt.exe $port configs\gestalt_sentry_fortress_infantry.yaml --timeout=300
+.\build\Release\gestalt.exe $port configs\gestalt_sentry_base_hero.yaml         --timeout=300
+
+# 3b) 实战整局接管（桥自己完成：生成哨兵→认领→布相机→开赛→打完整局）
+.\build\Release\gestalt.exe $port configs\gestalt_match_sentry.yaml --timeout=600
+
+# 4) 判读：日志末行 RESULT=...
+#    bench 轮看 hit_rate/det_rate（hp drop histogram 标定单发伤害：前哨20/车辆24）
+#    match 轮看 damage_dealt / lives_lost / bullets（hp 口径=自身存活，hit_rate 无意义）
+```
+
+观战：可另开 Monitor 桌面（gestalt_system 仓库 `Monitor/scripts/monitor-start.ps1 -Restart`），自动发现本机对局。
 
 ## 1 功能介绍
 自瞄的定义和意义。我们对自瞄的定义为“针对移动装甲板目标的自动瞄准和自动火控软件”。当操作手切换成自瞄模式后，自瞄会接管云台的控制权，通过对敌方运动轨迹的预测和弹道解算，控制云台进行追踪；同时，自瞄还会接管发射机构的控制权，判断开火时机。自瞄的意义在于提高我方作战能力，实现短击杀时间、高命中率的作战效果。 
