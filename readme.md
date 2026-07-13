@@ -8,6 +8,32 @@
 
 *为实现哨兵“追击”功能，本项目预留了与导航通信的ROS接口。
 
+## Gestalt 仿真桥（Windows）
+
+本分支增加了一个面向 `gestalt_system` 的本地闭环入口，同时保留原有真机/Linux 路径：
+
+- `src/gestalt.cpp` 复用原 YOLO、PnP、Tracker、EKF、Aimer 和 Shooter，不在游戏侧重写自瞄决策。
+- `io/gestalt/shared_frame_capture.*` 从进程私有共享内存读取最终视口像素，以及渲染该帧的同一份 `frame id / QPC / world time / camera position / camera quaternion / FOV`。姿态不经过 AttributeMap、TS 或网络广播。
+- `io/gestalt/game_link.*` 仅承担测试场景属性读取和 `RBExtAim` 控制命令，不向 EKF 注入目标位置、相位或转速真值。
+- Windows 构建通过 `GESTALT_EIGEN_INCLUDE`、`GESTALT_EXTRA_INCLUDE`、`GESTALT_EASYWS_DIR` 和 `OpenVINO_DIR` 指定依赖；Linux 原构建保持原有硬件 I/O 与 planner 路径。
+
+典型运行方式：
+
+```powershell
+.\build\Release\gestalt.exe <ws-port> .\configs\gestalt_far.yaml `
+  --setup=0 --mode=ekf --fire=0 --timeout=120 --dumpui=30
+```
+
+主要配置：
+
+- `configs/gestalt_far.yaml`：红方前哨，1280x720、FOV 25°、FXAA、中心 640x640 ROI。
+- `configs/gestalt_far_blue.yaml`：蓝方车辆靶；仅仿真配置启用英雄 `one/small -> one/big` 修正。
+- `configs/gestalt_observe.yaml` 与 `gestalt_{d45,d65,d85,f12,f16,f20,f24}.yaml`：相机/距离控制变量扫描。
+
+调试窗颜色：青色为本帧检测，绿色为 EKF 当前时刻的全部装甲板模型，红色为计入系统延迟和弹道后的未来命中板位。旋转目标上只应比较青框和最近的一只绿框；红框本来就不应与当前装甲重合。
+
+公平性边界：前哨转速幅值按规则书视为已知，旋转方向每局随机并必须由视觉时序估计。游戏内转速属性或底盘遥测只能用于离线验收，禁止进入估计或控制链。
+
 
 ## 1 功能介绍
 自瞄的定义和意义。我们对自瞄的定义为“针对移动装甲板目标的自动瞄准和自动火控软件”。当操作手切换成自瞄模式后，自瞄会接管云台的控制权，通过对敌方运动轨迹的预测和弹道解算，控制云台进行追踪；同时，自瞄还会接管发射机构的控制权，判断开火时机。自瞄的意义在于提高我方作战能力，实现短击杀时间、高命中率的作战效果。 

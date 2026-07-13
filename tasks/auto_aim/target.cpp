@@ -7,6 +7,19 @@
 
 namespace auto_aim
 {
+namespace
+{
+// ArmorBake/Outpost, relative to the baked rotation pivot (metres).  In the
+// bake's increasing local azimuth order the rotating plates are:
+//   plate 0 high -> plate 2 low -> plate 1 middle.
+// Only the relative offsets enter the estimator; the common world height
+// remains EKF state x[4].
+constexpr std::array<double, 3> kOutpostHeightOffsets{
+  0.13376389, -0.05910385, 0.03256157};
+
+int positive_mod3(int value) { return (value % 3 + 3) % 3; }
+}  // namespace
+
 Target::Target(
   const Armor & armor, std::chrono::steady_clock::time_point t, double radius, int armor_num,
   Eigen::VectorXd P0_dig)
@@ -99,7 +112,12 @@ void Target::predict(double dt)
     v2 = 0.1;  // 前哨站角加速度方差
   } else {
     v1 = 100;  // 加速度方差
-    v2 = 400;  // 角加速度方差
+    // 角加速度方差: 400 was tuned for real-robot yaw measurements; in the sim
+    // bridge the (position-synthesized) yaw is noisier and 400 lets omega whip
+    // between +-10 on a constant-rate spinner / integrate pure noise into a
+    // +-2 rad/s phantom spin on STATIC targets. 50 keeps top-speed onset
+    // response within ~3-4 frames while damping both failure modes.
+    v2 = 50;  // 角加速度方差
   }
   auto a = dt * dt * dt * dt / 4;
   auto b = dt * dt * dt / 2;
@@ -181,7 +199,89 @@ void Target::update(const Armor & armor)
   last_id = id;
   update_count_++;
 
+  update_outpost_height_model(armor, id);
+
   update_ypda(armor, id);
+}
+
+void Target::update_outpost_height_model(const Armor & armor, int id)
+{
+  if (name != ArmorName::outpost || armor_num_ != 3 || outpost_height_model_locked_) return;
+
+  const double measured_z = armor.xyz_in_world[2];
+  if (!std::isfinite(measured_z) || id < 0 || id >= 3) return;
+
+  outpost_height_updates_++;
+  outpost_seen_id_mask_ |= 1u << id;
+
+  // Six hypotheses: three cyclic shifts in each angular direction.  For the
+  // correct hypothesis, measured_z - fixed_plate_offset is one common pivot
+  // height for all three ids.  Track its variance online with Welford's method.
+  for (int hypothesis = 0; hypothesis < 6; ++hypothesis) {
+    const int shift = hypothesis % 3;
+    const int direction = hypothesis < 3 ? 1 : -1;
+    const int physical_slot = positive_mod3(shift + direction * id);
+    const double pivot_sample = measured_z - kOutpostHeightOffsets[physical_slot];
+    const int n = ++outpost_hyp_count_[hypothesis];
+    const double delta = pivot_sample - outpost_hyp_mean_[hypothesis];
+    outpost_hyp_mean_[hypothesis] += delta / n;
+    outpost_hyp_m2_[hypothesis] +=
+      delta * (pivot_sample - outpost_hyp_mean_[hypothesis]);
+  }
+
+  // Keep the proven flat-height behaviour during the short identification
+  // phase.  Lock only after all three angular ids have been observed repeatedly.
+  // Roughly three seconds at the measured detector rate, i.e. more than one
+  // complete 2.5 s drum revolution.  A full revolution averages the residual
+  // pose-vs-view-angle bias that made a 30-sample lock depend on its start phase.
+  if (outpost_height_updates_ < 90 || outpost_seen_id_mask_ != 0b111u) return;
+
+  int best = -1;
+  double best_variance = 1e10;
+  double second_variance = 1e10;
+  for (int hypothesis = 0; hypothesis < 6; ++hypothesis) {
+    const int n = outpost_hyp_count_[hypothesis];
+    if (n < 2) continue;
+    const double variance = outpost_hyp_m2_[hypothesis] / (n - 1);
+    if (variance < best_variance) {
+      second_variance = best_variance;
+      best_variance = variance;
+      best = hypothesis;
+    } else if (variance < second_variance) {
+      second_variance = variance;
+    }
+  }
+  if (best < 0) return;
+
+  outpost_height_hypothesis_ = best;
+  outpost_height_model_locked_ = true;
+
+  // Re-anchor the vertical state as the physical rotation-pivot height.  This
+  // removes the old common-height oscillation without touching XY, phase,
+  // radius, omega, association, or the raw PnP angle measurement.
+  ekf_.x[4] = outpost_hyp_mean_[best];
+  ekf_.x[5] = 0.0;
+  ekf_.P.row(4).setZero();
+  ekf_.P.col(4).setZero();
+  ekf_.P(4, 4) = 1e-2;
+  ekf_.P.row(5).setZero();
+  ekf_.P.col(5).setZero();
+  ekf_.P(5, 5) = 1e-1;
+
+  const int shift = best % 3;
+  const int direction = best < 3 ? 1 : -1;
+  tools::logger()->info(
+    "[Target] outpost height model locked: shift={} direction={} pivot_z={:.3f} "
+    "variance={:.5f} second={:.5f}",
+    shift, direction, ekf_.x[4], best_variance, second_variance);
+}
+
+double Target::outpost_height_offset(int id) const
+{
+  if (!outpost_height_model_locked_ || outpost_height_hypothesis_ < 0) return 0.0;
+  const int shift = outpost_height_hypothesis_ % 3;
+  const int direction = outpost_height_hypothesis_ < 3 ? 1 : -1;
+  return kOutpostHeightOffsets[positive_mod3(shift + direction * id)];
 }
 
 void Target::update_ypda(const Armor & armor, int id)
@@ -256,7 +356,9 @@ bool Target::convergened()
   }
 
   //前哨站特殊判断
-  if (this->name == ArmorName::outpost && update_count_ > 10 && !this->diverged()) {
+  if (
+    this->name == ArmorName::outpost && update_count_ > 10 && outpost_height_model_locked_ &&
+    !this->diverged()) {
     is_converged_ = true;
   }
 
@@ -273,6 +375,8 @@ Eigen::Vector3d Target::h_armor_xyz(const Eigen::VectorXd & x, int id) const
   auto armor_x = x[0] - r * std::cos(angle);
   auto armor_y = x[2] - r * std::sin(angle);
   auto armor_z = (use_l_h) ? x[4] + x[10] : x[4];
+  if (name == ArmorName::outpost && armor_num_ == 3)
+    armor_z += outpost_height_offset(id);
 
   return {armor_x, armor_y, armor_z};
 }

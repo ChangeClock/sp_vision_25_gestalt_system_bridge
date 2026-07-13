@@ -8,21 +8,67 @@ message(STATUS "--------------------CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}-------
 
 find_package(OpenCV REQUIRED)
 find_package(fmt REQUIRED)
-find_package(Eigen3 REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(yaml-cpp REQUIRED)
-find_package(nlohmann_json REQUIRED)
-set(OpenVINO_DIR "/opt/intel/openvino_2024.6.0/runtime/cmake/")
+# Modern yaml-cpp installs export yaml-cpp::yaml-cpp; older ones the bare target.
+if(TARGET yaml-cpp::yaml-cpp)
+  set(YAMLCPP_TARGET yaml-cpp::yaml-cpp)
+else()
+  set(YAMLCPP_TARGET yaml-cpp)
+endif()
+
+if(WIN32)
+  # Windows (gestalt UE-simulator bridge build): header-only deps may come from
+  # non-CMake locations (UE-bundled Eigen, single-header nlohmann/json).
+  # Pass -DGESTALT_EIGEN_INCLUDE=<dir> and -DGESTALT_EXTRA_INCLUDE=<dir>.
+  set(GESTALT_EIGEN_INCLUDE "" CACHE PATH "Eigen headers dir (e.g. UE ThirdParty/Eigen)")
+  set(GESTALT_EXTRA_INCLUDE "" CACHE PATH "extra include dir (nlohmann/json.hpp parent)")
+  set(GESTALT_EASYWS_DIR "" CACHE PATH "easywsclient sources dir (hpp+cpp)")
+  if(GESTALT_EIGEN_INCLUDE)
+    set(EIGEN3_INCLUDE_DIR "${GESTALT_EIGEN_INCLUDE}")
+  else()
+    find_package(Eigen3 REQUIRED)
+  endif()
+else()
+  find_package(Eigen3 REQUIRED)
+  find_package(nlohmann_json REQUIRED)
+endif()
+
+# OpenVINO: only default to the Linux system install when the caller did not
+# provide one (Windows: -DOpenVINO_DIR=<python site-packages>/openvino/cmake).
+if(NOT DEFINED OpenVINO_DIR AND NOT WIN32)
+  set(OpenVINO_DIR "/opt/intel/openvino_2024.6.0/runtime/cmake/")
+endif()
 find_package(OpenVINO REQUIRED)
 
 include_directories(${EIGEN3_INCLUDE_DIR})
 include_directories(${OpenCV_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR})
-
+if(WIN32 AND GESTALT_EXTRA_INCLUDE)
+  include_directories(${GESTALT_EXTRA_INCLUDE})
+endif()
 
 add_subdirectory(tools)
-add_subdirectory(io)
 add_subdirectory(tasks/auto_aim)
+
+if(WIN32)
+  # ---- gestalt: original auto_aim core + GameIO backend (DXGI capture + WS) ----
+  add_executable(gestalt
+    src/gestalt.cpp
+    io/gestalt/game_link.cpp
+    io/gestalt/shared_frame_capture.cpp
+    io/gestalt/win_capture.cpp
+    ${GESTALT_EASYWS_DIR}/easywsclient.cpp)
+  target_include_directories(gestalt PRIVATE ${GESTALT_EASYWS_DIR})
+  target_link_libraries(gestalt
+    ${OpenCV_LIBS} fmt::fmt spdlog::spdlog ${YAMLCPP_TARGET}
+    openvino::runtime auto_aim tools
+    d3d11 dxgi ws2_32)
+  target_compile_options(gestalt PRIVATE /utf-8)
+  target_compile_definitions(gestalt PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES)
+else()
+
+add_subdirectory(io)
 add_subdirectory(tasks/auto_buff)
 add_subdirectory(tasks/omniperception)
 
@@ -129,3 +175,5 @@ if(ament_cmake_FOUND AND rclcpp_FOUND AND std_msgs_FOUND AND rosidl_typesupport_
 else()
     message(STATUS "ROS2 environment not found, skipping ROS2-related code.")
 endif()
+
+endif()  # WIN32 / Linux split

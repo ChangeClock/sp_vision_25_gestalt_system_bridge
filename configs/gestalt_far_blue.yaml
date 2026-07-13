@@ -1,0 +1,57 @@
+# Static blue-armor benchmark companion to gestalt_far.yaml.
+# The only behavioral difference is the detector/tracker color filter; all
+# camera, PnP, EKF, ballistic and shooter parameters intentionally match.
+
+enemy_color: "blue"
+
+#####----- detector / yolo -----#####
+yolo_name: yolo11
+yolo11_model_path: assets/yolo11.xml
+classify_model: assets/tiny_resnet.onnx
+device: CPU
+min_confidence: 0.4
+sim_one_as_big: true
+roi: { x: 320, y: 26, width: 640, height: 640 }
+use_roi: true
+
+threshold: 150
+max_angle_error: 45
+min_lightbar_ratio: 1.5
+max_lightbar_ratio: 20
+min_lightbar_length: 8
+min_armor_ratio: 1
+max_armor_ratio: 5
+max_side_ratio: 1.5
+max_rectangular_error: 25
+
+#####----- tracker -----#####
+min_detect_count: 3
+max_temp_lost_count: 15
+outpost_max_temp_lost_count: 75
+max_frame_gap: 0.20
+
+#####----- aimer -----#####
+yaw_offset: 0
+pitch_offset: 0
+comming_angle: 60
+leaving_angle: 20
+decision_speed: 8
+high_speed_delay_time: 0.20
+low_speed_delay_time: 0.20
+
+#####----- shooter -----#####
+first_tolerance: 3
+second_tolerance: 2
+judge_distance: 2
+auto_fire: true
+
+#####----- geometry -----#####
+R_gimbal2imubody: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+R_camera2gimbal:  [0, 0, 1, -1, 0, 0, 0, -1, 0]
+t_camera2gimbal:  [0, 0, 0]
+
+camera_matrix: [2886.9, 0, 640.0, 0, 2886.9, 360.0, 0, 0, 1]
+distort_coeffs: [0, 0, 0, 0, 0]
+sim_quad_scale: 1.192
+z_adapter: false
+camera_json: '{"enabled":1,"fovDegrees":25,"shutterSpeed":120,"iso":600}'

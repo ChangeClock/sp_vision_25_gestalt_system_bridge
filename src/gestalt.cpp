@@ -1,0 +1,1319 @@
+// gestalt: ORIGINAL sp_vision auto_aim chain (detector/solver/tracker/aimer/
+// shooter, byte-identical) driving a UE-simulator sentry turret through the
+// GameIO backend (same-frame local shared-memory capture + WebSocket console). Mirrors
+// src/standard.cpp's loop; adds the prep-stage setup sequence (spawn pid0
+// sentry, drive to the standoff marker, external-turret claim) and the
+// auto_aim_test-style "reprojection" debug window.
+//
+// Usage: gestalt.exe <ws_port> [config] [--setup 1] [--fire 1]
+//        [--timeout 800]
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include <Eigen/Dense>
+#include <fmt/format.h>
+#include <opencv2/opencv.hpp>
+#include <yaml-cpp/yaml.h>
+
+#include "io/command.hpp"
+#include "io/gestalt/game_link.hpp"
+#include "io/gestalt/shared_frame_capture.hpp"
+#include "io/gestalt/win_capture.hpp"
+#include "tasks/auto_aim/aimer.hpp"
+#include "tasks/auto_aim/shooter.hpp"
+#include "tasks/auto_aim/solver.hpp"
+#include "tasks/auto_aim/tracker.hpp"
+#include "tasks/auto_aim/yolo.hpp"
+#include "tools/img_tools.hpp"
+#include "tools/logger.hpp"
+#include "tools/math_tools.hpp"
+
+using namespace std::chrono_literals;
+namespace ga = io::gestalt::attr;
+
+namespace
+{
+constexpr double kDeg2Rad = CV_PI / 180.0;
+constexpr double kRad2Deg = 180.0 / CV_PI;
+// transform_define.csv Outpost2026_0 (cm/100) — coarse bootstrap ONLY, never
+// enters the aim path (same convention as tools/outpost_benchmark.py).
+constexpr double kRedOutpostX = -3.81, kRedOutpostY = -2.83;
+constexpr double kStandoffXcm = 13.0, kStandoffYcm = -306.0;
+
+std::chrono::steady_clock::time_point qpc_to_steady(double t_seconds)
+{
+  // MSVC steady_clock ticks ARE QPC-since-boot scaled to ns, the same clock
+  // DXGI LastPresentTime uses — a direct construction stays on now()'s axis.
+  return std::chrono::steady_clock::time_point(
+    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(t_seconds)));
+}
+
+bool wait_for(const std::function<bool()> & pred, double timeout_s, double poll_s = 0.5)
+{
+  auto t_end = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_s);
+  while (std::chrono::steady_clock::now() < t_end) {
+    if (pred()) return true;
+    std::this_thread::sleep_for(std::chrono::duration<double>(poll_s));
+  }
+  return pred();
+}
+
+// ---- SIM-DOMAIN LIGHTBAR REFINEMENT (bridge/adapter layer) ----
+// The yolo11 keypoint head regresses near-symmetric quads on UE renders and
+// flattens the perspective asymmetry optimize_yaw discriminates on (raw-pixel
+// bar-length ratio modulates +-25-40% with target rotation vs the keypoints'
+// pinned 1.01 +- 0.03). Re-extract the two lightbar endpoint pairs from raw
+// pixels (color threshold + minAreaRect, the traditional-detector approach)
+// inside each detection box; yolo keeps detect/classify. The estimation chain
+// (solver/optimize_yaw/tracker/aimer) is untouched.
+bool refine_armor_points(const cv::Mat & img, auto_aim::Armor & armor)
+{
+  std::vector<cv::Point2f> kp(armor.points.begin(), armor.points.end());
+  cv::Rect box = cv::boundingRect(kp);
+  const int orig_x0 = box.x, orig_x1 = box.x + box.width;
+  int pad = std::max(8, box.height / 2);
+  box.x -= pad;
+  box.y -= pad;
+  box.width += 2 * pad;
+  box.height += 2 * pad;
+  box &= cv::Rect(0, 0, img.cols, img.rows);
+  if (box.width < 12 || box.height < 8) return false;
+
+  cv::Mat ch[3];
+  cv::split(img(box), ch);
+  const bool blue = armor.color == auto_aim::Color::blue;
+  const cv::Mat & p = blue ? ch[0] : ch[2];  // primary channel
+  const cv::Mat & o = blue ? ch[2] : ch[0];  // opposing channel
+  cv::Mat mask = (p > 90) & (p > o * 1.6) & (p > ch[1] * 1.3);
+
+  std::vector<std::vector<cv::Point>> cnts;
+  cv::findContours(mask, cnts, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+  struct Bar
+  {
+    cv::Point2f top, bot, c;
+    float len;
+  };
+  std::vector<Bar> bars;
+  for (const auto & c : cnts) {
+    if (cv::contourArea(c) < 4) continue;
+    cv::RotatedRect rr = cv::minAreaRect(c);
+    const float len = std::max(rr.size.width, rr.size.height);
+    const float wid = std::min(rr.size.width, rr.size.height);
+    if (len < 5.f || len / std::max(wid, 0.5f) < 1.5f) continue;
+    const float ang = rr.angle * static_cast<float>(CV_PI) / 180.f;
+    cv::Point2f axis = (rr.size.width >= rr.size.height)
+                         ? cv::Point2f(std::cos(ang), std::sin(ang))
+                         : cv::Point2f(-std::sin(ang), std::cos(ang));
+    if (axis.y < 0) axis = -axis;  // downward
+    const cv::Point2f half = axis * (len / 2.f);
+    bars.push_back({rr.center - half, rr.center + half, rr.center, len});
+  }
+  if (bars.size() < 2) return false;
+  std::sort(bars.begin(), bars.end(), [](const Bar & a, const Bar & b) { return a.c.x < b.c.x; });
+  const Bar & L = bars.front();
+  const Bar & R = bars.back();
+  if (R.c.x - L.c.x < 6.f) return false;
+  const float lr = L.len / std::max(R.len, 1e-3f);
+  if (lr < 0.35f || lr > 2.8f) return false;
+  // both bars must sit near the yolo box (reject neighbours leaking into the pad)
+  const float margin = 0.35f * (orig_x1 - orig_x0);
+  if (L.c.x + box.x < orig_x0 - margin || R.c.x + box.x > orig_x1 + margin) return false;
+
+  const cv::Point2f off(static_cast<float>(box.x), static_cast<float>(box.y));
+  armor.points[0] = L.top + off;  // TL
+  armor.points[1] = R.top + off;  // TR
+  armor.points[2] = R.bot + off;  // BR
+  armor.points[3] = L.bot + off;  // BL
+  armor.center = (armor.points[0] + armor.points[1] + armor.points[2] + armor.points[3]) * 0.25f;
+  return true;
+}
+}  // namespace
+
+int main(int argc, char ** argv)
+{
+  cv::CommandLineParser cli(
+    argc, argv,
+    "{@ws-port     |                     | game attribute-WS port}"
+    "{@config-path | configs/gestalt.yaml| yaml config}"
+    "{pos          | far                 | outpost bench position; far=Blue outpost-lob point (mode 5)}"
+    "{mode         | basic               | basic: fixed-axis median filter + known-omega timed fire (zero turret jitter, per-plate z) | ekf: original sp_vision chain}"
+    "{record       | 1                   | per-frame est-vs-gt jsonl to gestalt_record.jsonl}"
+    "{setup        | 1                   | run prep-stage spawn/drive/claim sequence}"
+    "{fire         | 1                   | allow trigger pulls}"
+    "{timeout      | 800                 | engagement wall-clock budget, s}"
+    "{dumpui       | 0                   | write every Nth annotated debug frame to ui_dump/ (0 = off)}");
+  const int port = cli.get<int>("@ws-port");
+  const std::string config = cli.get<std::string>("@config-path");
+  const std::string pos = cli.get<std::string>("pos");
+  const std::string run_mode = cli.get<std::string>("mode");
+  const bool mode_basic = run_mode == "basic";
+  const bool mode_observe = run_mode == "observe";
+  const bool do_record = cli.get<int>("record") != 0;
+  (void)mode_basic;  // basic-mode scaffolding pending; observe/ekf active
+  const bool do_setup = cli.get<int>("setup") != 0;
+  const bool allow_fire = cli.get<int>("fire") != 0;
+  const double timeout_s = cli.get<double>("timeout");
+  const int dump_ui_every = cli.get<int>("dumpui");
+  if (pos != "far") {
+    tools::logger()->error(
+      "[gestalt] invalid --pos={}: use far (Blue outpost-lob point, AIMoveMode=5)",
+      pos);
+    return 2;
+  }
+  if (dump_ui_every > 0) std::filesystem::create_directories("ui_dump");
+
+  tools::logger()->info("[gestalt] port={} config={}", port, config);
+
+  // Config extras (bridge-layer knobs; read BEFORE setup — camera_json is
+  // applied during the setup sequence and must match the yaml camera_matrix).
+  double sim_quad_scale = 1.192;
+  bool z_adapter = false;
+  bool bar_refine = false;
+  bool v_adapter = false;
+  double cfg_delay = 0.08;
+  Eigen::Matrix3d R_camera2gimbal_cfg{
+    {0, 0, 1},
+    {-1, 0, 0},
+    {0, -1, 0}};
+  std::string camera_json = R"({"enabled":1,"fovDegrees":45,"shutterSpeed":120})";
+  try {
+    auto yroot = YAML::LoadFile(config);
+    if (yroot["sim_quad_scale"].IsDefined()) sim_quad_scale = yroot["sim_quad_scale"].as<double>();
+    if (yroot["z_adapter"].IsDefined()) z_adapter = yroot["z_adapter"].as<bool>();
+    if (yroot["bar_refine"].IsDefined()) bar_refine = yroot["bar_refine"].as<bool>();
+    if (yroot["v_adapter"].IsDefined()) v_adapter = yroot["v_adapter"].as<bool>();
+    if (yroot["low_speed_delay_time"].IsDefined())
+      cfg_delay = yroot["low_speed_delay_time"].as<double>();
+    if (yroot["camera_json"].IsDefined()) camera_json = yroot["camera_json"].as<std::string>();
+    if (yroot["R_camera2gimbal"].IsDefined()) {
+      const auto values = yroot["R_camera2gimbal"].as<std::vector<double>>();
+      if (values.size() == 9)
+        R_camera2gimbal_cfg =
+          Eigen::Matrix<double, 3, 3, Eigen::RowMajor>(values.data());
+    }
+  } catch (...) {
+  }
+
+  io::gestalt::GameLink link(port);
+  if (!wait_for([&] { return link.connected(); }, 10)) {
+    tools::logger()->error("[gestalt] WS connect failed :{}", port);
+    return 1;
+  }
+  std::this_thread::sleep_for(2s);  // let the initial attribute sweep land
+
+  // ---------- prep-stage setup (mirrors tools/outpost_benchmark.py) ----------
+  if (do_setup) {
+    // Boot-readiness: the TS console isn't instantly live after the WS opens —
+    // a too-early Respawn is silently dropped (observed: full run with no
+    // sentry/outpost). Wait for telemetry, then retry the spawn.
+    wait_for([&] { return link.match_status() >= 0; }, 60);
+    const int previous_sentry = link.find_player(0).value_or(-1);
+    bool spawned = false;
+    for (int attempt = 0; attempt < 3 && !spawned; ++attempt) {
+      // Mario assault infantry has the more stable turret requested for the
+      // outpost bench. Team must be blue at spawn time so armor emissive color
+      // and detector class are correct.
+      link.exec("Respawn 0 66000008 1");
+      // Respawn is asynchronous.  An older alive sentry may remain in the
+      // attribute cache, so merely finding class/team can return immediately
+      // with stale map telemetry.  Wait for the newly allocated (higher) map.
+      spawned = wait_for(
+        [&] {
+          auto current = link.find_player(0);
+          return current && *current > previous_sentry;
+        },
+        15);
+    }
+    if (!spawned) {
+      tools::logger()->error("[gestalt] sentry spawn failed after retries");
+      return 1;
+    }
+  }
+  auto sentry_opt = link.find_player(0);
+  if (!sentry_opt) {
+    tools::logger()->error("[gestalt] no live pid-0 vehicle in telemetry");
+    return 1;
+  }
+  const int sentry = *sentry_opt;
+  if (
+    static_cast<int>(link.attr(sentry, ga::kClass).value_or(-1)) != 1003 ||
+    static_cast<int>(link.attr(sentry, ga::kTeamId).value_or(-1)) != 1) {
+    tools::logger()->error(
+      "[gestalt] pid-0 vehicle is not the blue Mario benchmark observer (map={})", sentry);
+    return 1;
+  }
+  double boot_bearing_deg = -83.3;  // outpost-lob point → red outpost, map-4 fallback
+  wait_for(
+    [&] {
+      auto op = link.find_red_outpost();
+      return op && link.attr(*op, ga::kHealth).value_or(0) > 0;
+    },
+    30);
+  const int outpost = link.find_red_outpost().value_or(-1);
+  tools::logger()->info(
+    "[gestalt] sentry map={} outpost map={} outpost_hp={}", sentry, outpost,
+    outpost > 0 ? link.attr(outpost, ga::kHealth).value_or(-1) : -1);
+
+  if (do_setup) {
+    // The benchmark harness controls pid 0 only. Never use a team/class BatchSet
+    // here: the standard scene deliberately contains a blue infantry target at
+    // the fortress, and a broad write would silently take control of that target.
+    link.exec(fmt::format("SetAttribute 0 {} 1", ga::kIsAI));
+    // Exact marker drive is selected by TargetMode=0. The bridge must not add
+    // turret scan/levelling policy while the vehicle navigates.
+    link.exec(fmt::format("SetAttribute 0 {} 0", ga::kTargetMode));
+    bool arrived = false;
+    {
+      // Canonical outpost-lob observer point: Blue GMapInfo mode-5 destination
+      // at (-4.50, 3.00)m.  A blue range hero's BASE-lob point is NOT generic
+      // Marker_40: the match strategy drives AIMoveMode=6 to the exact
+      // GMapInfo.DeploymentBlue point (-5.20, 8.50)m.  Marker_40 is only the
+      // broad deployment zone and its center may be off the usable navmesh.
+      constexpr double kOutpostLobXcm = -450.0;
+      constexpr double kOutpostLobYcm = 300.0;
+      link.exec(fmt::format("SetAttribute 0 {} 5", ga::kMoveMode));
+      auto t_drive_end =
+        std::chrono::steady_clock::now() + std::chrono::duration<double>(120);
+      int tick = 0;
+      while (std::chrono::steady_clock::now() < t_drive_end) {
+        auto x = link.attr(sentry, ga::kPosX), y = link.attr(sentry, ga::kPosY);
+        if (tick % 2 == 0 && x && y) {
+          tools::logger()->info(
+            "[gestalt] outpost-lob drive pos=({:.2f},{:.2f})m goal=(-4.50,3.00)m "
+            "error={:.2f}m",
+            *x / 100.0, *y / 100.0,
+            std::hypot(*x - kOutpostLobXcm, *y - kOutpostLobYcm) / 100.0);
+        }
+        if (
+          x && y &&
+          std::hypot(*x - kOutpostLobXcm, *y - kOutpostLobYcm) < 70.0) {
+          arrived = true;
+          break;
+        }
+        ++tick;
+        std::this_thread::sleep_for(500ms);
+      }
+    }
+    tools::logger()->info("[gestalt] pos={} drive arrived={}", pos, arrived);
+    if (!arrived) {
+      tools::logger()->error("[gestalt] invalid bench: sentry did not reach requested marker");
+      return 2;
+    }
+    link.exec(fmt::format("SetAttribute 0 {} 2", ga::kMoveMode));      // hold
+    link.exec(fmt::format("SetAttribute 0 {} 90", ga::kTargetMode));   // external
+    link.exec("ExtAimClaim 0 1");
+    link.exec("UEExec RBTakeOver 0");  // guarantee the viewport IS the gun view
+    // Respawn does NOT refill the 17mm allowance (player-scoped) — reset it so
+    // every run starts with the full 300-round budget.
+    link.exec(fmt::format("SetAttribute 0 {} 300", ga::kAllowance17mm));
+    // Motion blur smears the lightbars during turret slew (shutterSpeed only
+    // drives exposure, not blur) — kill it for detection stability.
+    link.exec("UEExec r.MotionBlurQuality 0");
+    link.exec("UEExec r.AntiAliasingMethod 1");  // FXAA: measured 99.7% detector recall
+    link.exec("UEExec r.RobotNav.DebugDraw 0");  // path overlays contaminate armor pixels
+    // Cap the game render at 30fps: frees CPU cores for OpenVINO inference
+    // (60fps rendering starves the detector to ~110ms/frame, tripping the
+    // tracker's hardcoded dt>0.1s lost-guard). 30fps present rate still
+    // exceeds the vision loop rate.
+    link.exec("UEExec t.MaxFPS 30");
+    link.exec("UEExec r.VisionBridge.Enable 1");
+    std::this_thread::sleep_for(2s);
+    link.apply_camera(camera_json);
+    std::this_thread::sleep_for(1500ms);
+
+    // Bootstrap: face the outpost so plates enter the frame (GT used once,
+    // like a driver would park the robot facing the target).
+    auto sx = link.attr(sentry, ga::kPosX).value_or(0) / 100.0;
+    auto sy = link.attr(sentry, ga::kPosY).value_or(0) / 100.0;
+    boot_bearing_deg = std::atan2(kRedOutpostY - sy, kRedOutpostX - sx) * kRad2Deg;
+    bool boot_aligned = false;
+    const auto t_align_end = std::chrono::steady_clock::now() + 8s;
+    while (std::chrono::steady_clock::now() < t_align_end) {
+      link.exec(fmt::format("UEExec RBExtAim 0 {:.1f} 10 0", boot_bearing_deg));
+      const auto yaw = link.attr(sentry, ga::kTurretYaw);
+      const auto pitch = link.attr(sentry, ga::kTurretPitch);
+      if (
+        yaw && pitch && std::abs(std::remainder(*yaw - boot_bearing_deg, 360.0)) < 1.5 &&
+        std::abs(*pitch - 10.0) < 1.5) {
+        boot_aligned = true;
+        break;
+      }
+      std::this_thread::sleep_for(250ms);
+    }
+    if (!boot_aligned) {
+      tools::logger()->error(
+        "[gestalt] invalid bench: turret did not settle at outpost bootstrap pose");
+      return 2;
+    }
+  }
+  else {
+    // A no-setup diagnostic must still apply the camera/render half of the
+    // selected configuration.  Otherwise switching from FOV25 to FOV15 while
+    // reusing an existing vehicle silently leaves K and the rendered FOV out
+    // of sync, invalidating every PnP/reprojection comparison.
+    link.exec("UEExec r.MotionBlurQuality 0");
+    link.exec("UEExec r.AntiAliasingMethod 1");
+    link.exec("UEExec r.RobotNav.DebugDraw 0");
+    link.exec("UEExec t.MaxFPS 30");
+    link.exec("UEExec r.VisionBridge.Enable 1");
+    link.apply_camera(camera_json);
+    std::this_thread::sleep_for(1500ms);
+  }
+
+  // ---------- capture + the ORIGINAL auto_aim chain ----------
+  io::gestalt::SharedFrameCapture cap;
+  if (!cap.init(15000)) {
+    tools::logger()->error(
+      "[gestalt] local frame stream unavailable; ensure the rebuilt game is running and "
+      "r.VisionBridge.Enable=1");
+    return 1;
+  }
+  tools::logger()->info(
+    "[gestalt] local frame stream '{}' pid={}", cap.window_title(), cap.process_id());
+  // Restore once so a minimized viewport resumes rendering. Do not keep
+  // forcing topmost/focus during the control loop.
+  cap.raise_window();
+
+  auto_aim::YOLO detector(config, false);
+  auto_aim::Solver solver(config);
+  auto_aim::Tracker tracker(config, solver);
+  auto_aim::Aimer aimer(config);
+  auto_aim::Shooter shooter(config);
+
+  // Sim render calibration: the UE lightbars are drawn INSET vs the physical
+  // 135x56mm armor model — raw PnP over-solves range by ~1.192x (measured at a
+  // GT-anchored 4.28m standoff; see tools/aim_solver.py PER_NAME_QUAD_SCALE).
+  // Expanding the detected quad about its centroid by the same factor feeds the
+  // UNMODIFIED solver keypoints consistent with its full-size object model:
+  // bearing unchanged, range (and thus ballistic pitch + fly-time) corrected.
+  tools::logger()->info(
+    "[gestalt] sim_quad_scale={} z_adapter={} bar_refine={} v_adapter={} delay={}", sim_quad_scale,
+    z_adapter, bar_refine, v_adapter, cfg_delay);
+  std::deque<double> v_hist_x, v_hist_y;  // vehicle plate-position history (v_adapter)
+  std::deque<double> va_vlat;             // recent lateral velocities (rotation evidence)
+  std::deque<double> va_dest;             // width-ratio range estimates (median-filtered)
+  double va_prev_lat = 0, va_prev_t = -1;
+
+  // 2026-outpost z-stagger adapter (bridge layer; sp_vision_25's EKF locks all
+  // 3 plates to ONE height, but the 2026 drum staggers them ~101/111/142 cm).
+  // Learn each plate's true z by binning raw measurements by drum phase
+  // relative to the EKF tracked-plate angle, then correct the commanded pitch
+  // for the plate the aimer chose.
+  double zsum[3] = {0, 0, 0};
+  int zn[3] = {0, 0, 0};
+  // un-stagger state: online 3-cluster of raw plate heights + last EKF pose
+  double zc_mean[3] = {0, 0, 0};
+  int zc_cnt[3] = {0, 0, 0};
+  int zc_n = 0;
+  std::deque<double> ctr_hist_x, ctr_hist_y;  // drum-center running estimate
+  // Bridge phase filter: rulebook |omega|=2.513 (same prior sp_vision hardcodes
+  // in target.cpp), sign locked by majority vote of measured phase deltas,
+  // measurements folded mod 120° onto the nearest plate slot (single-frame
+  // radial phase is noisy: ~0.5-1° bearing noise vs the 0.28m orbit).
+  double ph_hat = 0, ph_t = -1;
+  int ph_sign = 0;  // 0 = unlocked
+  bool ph_geometry_frozen = false;
+  double ph_cx = 0, ph_cy = 0, ph_zmid = 0;
+  std::deque<int> ph_votes;
+  constexpr double kOmegaBook = 2.513;
+  // Per-height visibility tracks for the SIGN.  The three staggered outpost
+  // plates are distinguishable by height, but detections from different
+  // heights are interleaved in the same frame.  A single episode buffer would
+  // therefore splice three different plates together and make the sign vote a
+  // coin flip.  Keep one unwrapped phase history per learned height cluster.
+  std::vector<std::pair<double, double>> ep_samples[3];  // (t, phi_unwrapped)
+  double ep_last_t[3] = {-1, -1, -1};
+  double ep_last_phi[3] = {0, 0, 0};
+  double ep_last_vote_t[3] = {-1, -1, -1};
+  double ph_hyp_last_t = -1;
+  double last_cx = 0, last_cy = 0, last_a = 0;
+  bool last_target_ok = false;
+  double cfg_fy = 1545.1;
+  try {
+    auto km = YAML::LoadFile(config)["camera_matrix"].as<std::vector<double>>();
+    if (km.size() == 9) cfg_fy = km[4];
+  } catch (...) {
+  }
+  auto wrap_rad = [](double a) {
+    while (a > CV_PI) a -= 2 * CV_PI;
+    while (a < -CV_PI) a += 2 * CV_PI;
+    return a;
+  };
+  auto phase_bucket = [&](double rel_angle) {
+    int k = static_cast<int>(std::lround(wrap_rad(rel_angle) / (2.0 * CV_PI / 3.0)));
+    return ((k % 3) + 3) % 3;
+  };
+
+  const double hp0 = outpost > 0 ? link.attr(outpost, ga::kHealth).value_or(1500) : 1500;
+  const double allow0 = link.attr(sentry, ga::kAllowance17mm).value_or(300);
+
+  // Async debug window: imshow/waitKey stall 40-80ms on this box — feeding a
+  // UI thread through a latest-frame mailbox keeps the vision loop under the
+  // tracker's hardcoded dt>0.1s lost-guard while the window stays live.
+  std::mutex ui_mu;
+  cv::Mat ui_frame;
+  std::atomic<bool> ui_quit{false};
+  std::thread ui_thread([&] {
+    cv::Mat local;
+    while (!ui_quit) {
+      {
+        std::lock_guard<std::mutex> lk(ui_mu);
+        if (!ui_frame.empty()) {
+          ui_frame.copyTo(local);
+          ui_frame.release();
+        }
+      }
+      if (!local.empty()) {
+        cv::resize(local, local, {}, 0.5, 0.5);
+        cv::imshow("reprojection", local);
+        local.release();
+      }
+      if (cv::waitKey(30) == 'q') ui_quit = true;
+    }
+  });
+
+  io::Command last_cmd{false, false, 0, 0};
+  int frames = 0, det_frames = 0, cmds = 0, shots = 0, grab_fail = 0;
+  int det_color_hist[4] = {0, 0, 0, 0};  // red/blue/extinguish/purple raw counts
+  auto t_ekf_log = std::chrono::steady_clock::now();
+
+  // ---- BASIC mode state (fixed-axis median filter + known-omega timed fire) ----
+  // The turret HOLDS the drum-axis bearing (zero command jitter — the ideal
+  // LQR otherwise reproduces every aimer flip-flop), pitch pre-positions for
+  // the NEXT-arriving plate's learned height, and fire is scheduled so the
+  // bullet ARRIVES at the plate crossing: t_fire = t_cross - fly - delay.
+  std::deque<double> b_yaw_hist, b_dist_hist, b_z_hist;
+  double b_phase_anchor = 0, b_phase_anchor_t = -1;  // de-rotated plate phase base
+  double b_omega = 0;                                // signed rad/s (game truth)
+  double b_plate_z[3] = {0, 0, 0};
+  int b_plate_zn[3] = {0, 0, 0};
+  FILE * rec_fp = nullptr;
+  if (do_record) rec_fp = std::fopen("gestalt_record.jsonl", "w");
+
+  // ---- OBSERVE mode: camera-parameter sweep bench (no aiming, no firing) ----
+  struct SweepPhase
+  {
+    std::string name, camera, exec;
+    double secs = 18;
+  };
+  std::vector<SweepPhase> sweep;
+  if (mode_observe) {
+    try {
+      auto ysweep = YAML::LoadFile(config)["sweep"];
+      for (const auto & ph : ysweep) {
+        SweepPhase p;
+        p.name = ph["name"].as<std::string>();
+        if (ph["camera"].IsDefined()) p.camera = ph["camera"].as<std::string>();
+        if (ph["exec"].IsDefined()) p.exec = ph["exec"].as<std::string>();
+        if (ph["secs"].IsDefined()) p.secs = ph["secs"].as<double>();
+        sweep.push_back(p);
+      }
+    } catch (...) {
+    }
+    tools::logger()->info("[observe] sweep phases={}", sweep.size());
+  }
+  size_t sweep_idx = 0;
+  bool sweep_phase_started = false;
+  auto sweep_t0 = std::chrono::steady_clock::now();
+  int sw_frames = 0, sw_det = 0;
+  double sw_conf = 0, sw_width = 0, sw_last_w = 0;
+  std::string sw_last_state = "-";
+  auto median_of = [](std::deque<double> & d) {
+    std::vector<double> v(d.begin(), d.end());
+    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+    return v[v.size() / 2];
+  };
+  auto launch_pitch = [](double v0, double d, double h) -> std::pair<double, double> {
+    // closed-form low arc (mirrors tools/trajectory.cpp), returns (pitch, fly)
+    double a = 9.81 * d * d / (2 * v0 * v0), b = -d, c = a + h;
+    double delta = b * b - 4 * a * c;
+    if (delta < 0) return {0.2, d / v0};
+    double p1 = std::atan((-b + std::sqrt(delta)) / (2 * a));
+    double p2 = std::atan((-b - std::sqrt(delta)) / (2 * a));
+    double t1 = d / (v0 * std::cos(p1)), t2 = d / (v0 * std::cos(p2));
+    return t1 < t2 ? std::make_pair(p1, t1) : std::make_pair(p2, t2);
+  };
+  auto t_end = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_s);
+  auto t_log = std::chrono::steady_clock::now();
+
+  bool hp_seen = false;
+  while (std::chrono::steady_clock::now() < t_end) {
+    const double hp = outpost > 0 ? link.attr(outpost, ga::kHealth).value_or(0) : -1;
+    const double allow = link.attr(sentry, ga::kAllowance17mm).value_or(0);
+    if (hp > 0) hp_seen = true;
+    // Only honor hp==0 after a live reading: at boot the attribute may simply
+    // not have arrived yet (value_or(0) — the 0.12-sweep instant-exit race).
+    if ((hp_seen && hp == 0) || (hp_seen && allow <= 0)) break;
+
+    auto now = std::chrono::steady_clock::now();
+
+    auto t_grab0 = std::chrono::steady_clock::now();
+    auto frame = cap.grab(50);
+    auto t_grab1 = std::chrono::steady_clock::now();
+    static double grab_acc = 0, rej_acc = 0;
+    static int grab_n = 0, rej_n = 0;
+    if (!frame.ok) {
+      rej_acc += std::chrono::duration<double, std::milli>(t_grab1 - t_grab0).count();
+      rej_n++;
+      if (++grab_fail % 100 == 0) cap.init();  // device-loss recovery
+      continue;
+    }
+    grab_acc += std::chrono::duration<double, std::milli>(t_grab1 - t_grab0).count();
+    grab_n++;
+    grab_fail = 0;
+    frames++;
+
+    // The local frame packet contains the FINAL FSceneView quaternion that
+    // rendered these exact pixels. It replaces the old 30Hz AttributeMap
+    // arrival-time interpolation entirely.
+    if (!frame.has_camera_pose) continue;
+    const auto & qv = frame.camera_quaternion_ue_xyzw;
+    Eigen::Quaterniond q_camera_ue(qv[3], qv[0], qv[1], qv[2]);
+    q_camera_ue.normalize();
+
+    // UE world is left-handed (X forward, Y right, Z up). sp_vision world is
+    // right-handed (X forward, Y left, Z up). OpenCV camera is x-right,
+    // y-down, z-forward. Applying both reflections yields a proper rotation.
+    const Eigen::Matrix3d S_ueworld_to_rh{
+      {1, 0, 0},
+      {0, -1, 0},
+      {0, 0, 1}};
+    const Eigen::Matrix3d R_cvcam_to_uecamera{
+      {0, 0, 1},
+      {1, 0, 0},
+      {0, -1, 0}};
+    const Eigen::Matrix3d R_camera2world =
+      S_ueworld_to_rh * q_camera_ue.toRotationMatrix() * R_cvcam_to_uecamera;
+    const Eigen::Matrix3d R_gimbal2world =
+      R_camera2world * R_camera2gimbal_cfg.transpose();
+    solver.set_R_gimbal2world(Eigen::Quaterniond(R_gimbal2world));
+
+    const Eigen::Vector3d gimbal_ypr = tools::eulers(R_gimbal2world, 2, 1, 0);
+    const double tyaw = gimbal_ypr[0];
+    const double tyaw_ue = -tyaw;
+    const double tpitch = -gimbal_ypr[1];
+
+    const auto t = qpc_to_steady(frame.t_present);
+    auto t_det0 = std::chrono::steady_clock::now();
+    auto armors = detector.detect(frame.img);
+    auto t_det1 = std::chrono::steady_clock::now();
+    if (!armors.empty()) det_frames++;
+    // Detection histogram (raw, BEFORE tracker filters erase misclassified
+    // plates) + color normalization: red outpost plates flicker to class-18
+    // "blue outpost" at glancing angles; tracker.cpp:43 drops color!=enemy and
+    // starves the EKF. The C++ tracker has no "enemy_color: any" — forcing the
+    // color on outpost-named detections is the bridge-side equivalent.
+    for (auto & armor : armors) {
+      det_color_hist[static_cast<int>(armor.color) & 3]++;
+      if (armor.name == auto_aim::ArmorName::outpost)
+        armor.color = auto_aim::Color::red;
+    }
+    // Subpixel bar endpoints from raw pixels (falls back to yolo keypoints per armor)
+    if (bar_refine)
+      for (auto & armor : armors) refine_armor_points(frame.img, armor);
+    // Snapshot for the debug window: yolo's own verdicts (conf/color/name/type),
+    // as drawn by the original "detection" window (yolo11.cpp draw_detections),
+    // captured before track() mutates/erases the list.
+    auto armors_ui = armors;
+    if (sim_quad_scale != 1.0) {
+      for (auto & armor : armors) {
+        cv::Point2f c(0.f, 0.f);
+        for (const auto & p : armor.points) c += p;
+        c *= 1.0f / static_cast<float>(armor.points.size());
+        for (auto & p : armor.points)
+          p = c + (p - c) * static_cast<float>(sim_quad_scale);
+      }
+    }
+    // ---- 2026-drum MEASUREMENT SUBSTITUTION (bridge layer, before track) ----
+    // Two structural mismatches between sp_vision_25's model and this render:
+    //  (1) the 3 plates are height-STAGGERED (~101/111/142cm) while the EKF
+    //      locks one ring height -> NIS resets;
+    //  (2) the PnP plate NORMAL is frozen near the LOS at every resolution
+    //      (bench: span 13-21° vs the true ±60° sweep) -> omega unobservable.
+    // Both are fixed at the KEYPOINT boundary, pure vision, solver untouched:
+    // solve each detection, estimate the drum center as the running mean of
+    // plate positions (the orbit averages out), synthesize the plate pose
+    // {x, y, z_mid, yaw = radial atan2(plate - center)}, and REPROJECT it with
+    // the solver's own model into replacement keypoints. The tracker's internal
+    // re-solve then recovers exactly this pose: flat drum + ROTATING normal.
+    // ---- VEHICLE POSITION-SYNTHESIZED NORMAL (v_adapter, bridge layer) ----
+    // Vehicle plates ride a ~0.25m ring around the chassis center; the plate's
+    // radial azimuth about that center IS the rotation phase, measurable at
+    // ~1-2deg/frame from POSITION alone (the per-frame PnP normal is unusable
+    // at these plate scales -- yolo head flattens it and the flat-plate model
+    // can't consume the 3D-bar asymmetry). Synthesize the plate normal as the
+    // outward radial and reproject: the drum z_adapter recipe generalized to
+    // 4-plate vehicles. Static targets (radial spread < 0.10m) pass through.
+    if (v_adapter && !z_adapter) {
+      static int va_applied = 0, va_rad_rej = 0, va_warm = 0, va_n = 0;
+      static double va_rad_acc = 0;
+      for (auto & armor : armors) solver.solve(armor);  // pre-solve: pair logic reads peers
+      for (auto & armor : armors) {
+        const double xr = armor.xyz_in_world[0], yr = armor.xyz_in_world[1];
+        if (std::hypot(xr, yr) < 0.5) continue;
+        v_hist_x.push_back(xr);
+        v_hist_y.push_back(yr);
+        if (v_hist_x.size() > 150) {
+          v_hist_x.pop_front();
+          v_hist_y.pop_front();
+        }
+        if (v_hist_x.size() < 30) {
+          va_warm++;
+          continue;
+        }
+        // median center: robust to the asymmetric per-plate sampling that
+        // biases a mean and inflates/deflates the synthesized sweep
+        const double cx = median_of(v_hist_x);
+        const double cy = median_of(v_hist_y);
+        // Rotation evidence gate on sustained LATERAL VELOCITY. Spatial spread
+        // alone fails twice over: PnP depth noise on a static target looks like
+        // radial motion, and a corner-aspect TWO-plate view hops between two
+        // fixed lateral clusters (spread ~0.3m with zero rotation). A spinning
+        // plate instead SWEEPS at |v_lat| = r*omega ~ 1.5 m/s with a constant
+        // sign inside each visibility window, while switch jumps (>0.25m per
+        // frame) break the chain.
+        {
+          const double c_norm = std::hypot(cx, cy);
+          if (c_norm < 0.5) continue;
+          const double px_ = -cy / c_norm, py_ = cx / c_norm;  // unit perpendicular to LOS
+          const double lat = (xr - cx) * px_ + (yr - cy) * py_;
+          const double t_now = frame.t_present;
+          const double dt_lat = t_now - va_prev_t;
+          if (va_prev_t > 0 && dt_lat > 0 && dt_lat < 0.12) {
+            const double dlat = lat - va_prev_lat;
+            if (std::abs(dlat) < 0.25)
+              va_vlat.push_back(dlat / dt_lat);
+            else
+              va_vlat.clear();  // plate-switch jump
+            while (va_vlat.size() > 3) va_vlat.pop_front();
+          } else if (dt_lat >= 0.12) {
+            va_vlat.clear();
+          }
+          va_prev_lat = lat;
+          va_prev_t = t_now;
+          bool sweeping = va_vlat.size() >= 2;
+          for (size_t i = 0; sweeping && i < va_vlat.size(); ++i)
+            sweeping = std::abs(va_vlat[i]) > 0.4 && (va_vlat[i] > 0) == (va_vlat.front() > 0);
+          if (!sweeping) {
+            // Static/ambiguous: the per-frame plate yaw is unobservable here and
+            // optimize_yaw freezes at an arbitrary in-window angle (observed
+            // near EDGE-ON, ~90deg off, drawing the model plate as a line).
+            // Single plate: inject the FACE-ON prior (bounded error <=45deg by
+            // the visibility cone). TWO plates in frame: their center-to-center
+            // segment runs at 45deg to both faces, so the chassis orientation
+            // is EXACT -- normals = segment azimuth +-45deg, pick per plate the
+            // candidate nearest its face-on direction.
+            const double beta = std::atan2(yr, xr);
+            double yaw_inj = beta;  // face-on prior (single-plate case)
+            double dist_corr = 1.0;
+            if (armors.size() == 2) {
+              // Two adjacent plates: tan(tilt) = W_other/W_this from apparent
+              // widths (lateral, pixel-precise -- the center-to-center segment
+              // azimuth is depth-noise dominated at this range and unusable).
+              // Resolve the sign/side with a 4-combo bearing test against the
+              // OTHER plate's observed bearing.
+              const auto & other = (&armor == &armors.front()) ? armors.back() : armors.front();
+              if (other.xyz_in_world.norm() > 0.5) {
+                const double w_this = cv::norm(armor.points[0] - armor.points[1]);
+                const double w_oth = cv::norm(other.points[0] - other.points[1]);
+                if (w_this > 4 && w_oth > 4) {
+                  const double phi = std::atan2(w_oth, w_this);  // |tilt| in (0,90)
+                  // Width-ratio RANGE: W_this = m*cos(phi)*fy/d and cos(phi) =
+                  // W_this/hypot(W1,W2)  =>  d = m*fy/hypot(W1,W2). Lateral
+                  // pixel-precise, replaces the oblique-aspect PnP depth that
+                  // runs ~0.7-0.9m long and inflates the drawn model boxes.
+                  const double m_w = (armor.type == auto_aim::ArmorType::big) ? 0.230 : 0.135;
+                  const double d_est = m_w * cfg_fy / std::hypot(w_this, w_oth);
+                  if (d_est > 1.0 && d_est < 20.0) {
+                    va_dest.push_back(d_est);
+                    while (va_dest.size() > 20) va_dest.pop_front();
+                  }
+                  const double b_obs = std::atan2(other.xyz_in_world[1], other.xyz_in_world[0]);
+                  const double s_half = 0.20;  // chassis half-size, m
+                  double best_err = 1e9;
+                  for (int cs = -1; cs <= 1; cs += 2) {
+                    const double psi = wrap_rad(beta + cs * phi);
+                    for (int side = -1; side <= 1; side += 2) {
+                      const double qx = xr + s_half * (std::cos(psi) + std::cos(psi + side * CV_PI / 2));
+                      const double qy = yr + s_half * (std::sin(psi) + std::sin(psi + side * CV_PI / 2));
+                      const double err = std::abs(wrap_rad(std::atan2(qy, qx) - b_obs));
+                      if (err < best_err) {
+                        best_err = err;
+                        yaw_inj = psi;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            // Median-filtered width-ratio range: applied on EVERY static frame
+            // (single- or two-plate) so the distance never toggles between the
+            // corrected and raw-PnP value as the second plate flickers in and
+            // out of detection (observed as r 0.20<->0.37 churn + NIS resets).
+            if (va_dest.size() >= 5) {
+              const double d_pnp = armor.xyz_in_world.norm();
+              const double d_med = median_of(va_dest);
+              if (d_pnp > 1.0) dist_corr = d_med / d_pnp;
+            }
+            auto pts_f = solver.reproject_armor(
+              Eigen::Vector3d{xr * dist_corr, yr * dist_corr, armor.xyz_in_world[2] * dist_corr},
+              yaw_inj, armor.type, armor.name);
+            if (pts_f.size() == 4)
+              for (int i = 0; i < 4; ++i) armor.points[i] = pts_f[i];
+            continue;
+          }
+        }
+        const double rad = std::hypot(xr - cx, yr - cy);
+        va_rad_acc += rad;
+        if (++va_n % 100 == 0)
+          tools::logger()->info(
+            "[vadapt] applied={} rad_rej={} warm={} rad_avg={:.3f}", va_applied, va_rad_rej,
+            va_warm, va_rad_acc / va_n);
+        if (rad < 0.06 || rad > 0.60) {
+          va_rad_rej++;
+          continue;  // static / implausible -> pass through
+        }
+        va_applied++;
+        // armor-yaw convention: optimize_yaw searches +-70deg around the GIMBAL
+        // heading, i.e. yaw points from camera INTO the scene -- the INWARD
+        // ring normal (center-to-plate + pi), not the outward radial.
+        const double phi = std::atan2(yr - cy, xr - cx) + CV_PI;
+        auto pts = solver.reproject_armor(
+          Eigen::Vector3d{xr, yr, armor.xyz_in_world[2]}, phi, armor.type, armor.name);
+        if (pts.size() == 4)
+          for (int i = 0; i < 4; ++i) armor.points[i] = pts[i];
+      }
+    }
+    const bool phase_locked_at_frame_start = ph_sign != 0;
+    if (z_adapter) {
+      for (auto & armor : armors) {
+        solver.solve(armor);  // raw world pose of THIS detection
+        double zr = armor.xyz_in_world[2];
+        double xr = armor.xyz_in_world[0], yr = armor.xyz_in_world[1];
+        double dist = std::hypot(xr, yr);
+        if (dist < 0.5) continue;
+        ctr_hist_x.push_back(xr);
+        ctr_hist_y.push_back(yr);
+        if (ctr_hist_x.size() > 80) {
+          ctr_hist_x.pop_front();
+          ctr_hist_y.pop_front();
+        }
+        // learn per-phase TRUE height (for the fire-time pitch correction)
+        if (last_target_ok) {
+          double ang = std::atan2(yr - last_cy, xr - last_cx);
+          // ang is center->plate (outward), while EKF x[6] is plate->center
+          // (inward). Comparing them directly adds a 180deg offset, exactly
+          // halfway between 120deg slots, so heights alias between plate IDs.
+          const double base_outward = wrap_rad(last_a + CV_PI);
+          int k = phase_bucket(ang - base_outward);
+          zsum[k] += zr;
+          zn[k]++;
+        }
+        // online 3-cluster of raw heights; z_mid = median cluster mean
+        int ci = -1;
+        for (int i = 0; i < zc_n; ++i)
+          if (std::abs(zr - zc_mean[i]) < 0.06) { ci = i; break; }
+        if (ci < 0 && zc_n < 3) { ci = zc_n++; zc_mean[ci] = zr; zc_cnt[ci] = 0; }
+        if (ci < 0) {
+          double best = 1e9;
+          for (int i = 0; i < zc_n; ++i)
+            if (std::abs(zr - zc_mean[i]) < best) { best = std::abs(zr - zc_mean[i]); ci = i; }
+        }
+        zc_cnt[ci]++;
+        zc_mean[ci] += (zr - zc_mean[ci]) / std::min(zc_cnt[ci], 50);
+        // substitution needs a settled center (>=1 drum period of samples)
+        if (ctr_hist_x.size() < 50 || zc_n < 3) continue;
+        double cx = 0, cy = 0;
+        for (double v : ctr_hist_x) cx += v;
+        for (double v : ctr_hist_y) cy += v;
+        cx /= ctr_hist_x.size();
+        cy /= ctr_hist_y.size();
+        double rad = std::hypot(xr - cx, yr - cy);
+        if (rad < 0.10 || rad > 0.45) continue;  // implausible radial -> pass through
+        double a_ = zc_mean[0], b_ = zc_mean[1], c_ = zc_mean[2];
+        double zmid = std::max(std::min(a_, b_), std::min(std::max(a_, b_), c_));
+        double phi_raw = std::atan2(yr - cy, xr - cx);  // radial = plate normal azimuth
+        double t_now_s = frame.t_present;
+        // --- sign vote: independent least-squares slope for this height ---
+        auto & samples = ep_samples[ci];
+        // At the far perch one height may only be detected every few frames.
+        // Up to 0.65 s is still unambiguous at 2.513 rad/s (< pi phase travel),
+        // so retain the same-plate track across those detector gaps.
+        const bool ep_break = ep_last_t[ci] < 0 || (t_now_s - ep_last_t[ci]) > 0.65;
+        // Do not discard sparse observations here.  Besides the local slope
+        // vote below, the known-|omega| hypothesis test needs long-baseline
+        // samples and is invariant to whole-turn phase wrapping.
+        double phi_unw = phi_raw;
+        if (!samples.empty()) {  // unwrap only against the same physical plate
+          double d = wrap_rad(phi_raw - ep_last_phi[ci]);
+          phi_unw = samples.back().second + d;
+        }
+        samples.emplace_back(t_now_s, phi_unw);
+        if (samples.size() > 80) samples.erase(samples.begin());
+        ep_last_phi[ci] = phi_raw;
+        ep_last_t[ci] = t_now_s;
+        if (
+          samples.size() >= 4 && samples.back().first - samples.front().first > 0.35 &&
+          (ep_last_vote_t[ci] < 0 || t_now_s - ep_last_vote_t[ci] > 0.12)) {
+          double tm = 0, pm = 0;
+          for (const auto & s : samples) { tm += s.first; pm += s.second; }
+          tm /= samples.size();
+          pm /= samples.size();
+          double num = 0, den = 0;
+          for (const auto & s : samples) {
+            num += (s.first - tm) * (s.second - pm);
+            den += (s.first - tm) * (s.first - tm);
+          }
+          const double slope = den > 1e-9 ? num / den : 0;
+          if (std::abs(slope) > 0.8 && std::abs(slope) < 5.0) {
+            ph_votes.push_back(slope > 0 ? 1 : -1);
+            if (ph_votes.size() > 9) ph_votes.pop_front();
+            int vote_sum = 0;
+            for (int v : ph_votes) vote_sum += v;
+            // Local slopes are useful diagnostics but are too noisy to own the
+            // lock.  Only the long-baseline known-speed hypothesis below may
+            // select the per-round direction.
+            ep_last_vote_t[ci] = t_now_s;
+            tools::logger()->info(
+              "[phase] cluster={} slope={:.2f} vote_sum={} sign={}", ci, slope, vote_sum,
+              ph_sign);
+          }
+        }
+        // Binary known-speed hypothesis.  For each height-identified plate,
+        // de-rotate all observations with +/-|omega|.  Under the correct sign
+        // they collapse to one circular phase; under the wrong sign they
+        // spread around the circle.  Sum per-cluster resultant lengths because
+        // each plate has its own unknown phase offset.
+        if (ph_hyp_last_t < 0 || t_now_s - ph_hyp_last_t > 0.5) {
+          ph_hyp_last_t = t_now_s;
+          double score_pos_sum = 0, score_neg_sum = 0;
+          int hyp_n = 0;
+          double hyp_t_min = 1e100, hyp_t_max = -1e100;
+          for (int hc = 0; hc < 3; ++hc) {
+            const auto & hs = ep_samples[hc];
+            if (hs.size() < 4) continue;
+            const double t0 = hs.front().first;
+            double pc = 0, ps = 0, nc = 0, ns = 0;
+            for (const auto & obs : hs) {
+              const double dt_h = obs.first - t0;
+              const double rp = obs.second - kOmegaBook * dt_h;
+              const double rn = obs.second + kOmegaBook * dt_h;
+              pc += std::cos(rp);
+              ps += std::sin(rp);
+              nc += std::cos(rn);
+              ns += std::sin(rn);
+            }
+            score_pos_sum += std::hypot(pc, ps);
+            score_neg_sum += std::hypot(nc, ns);
+            hyp_n += static_cast<int>(hs.size());
+            hyp_t_min = std::min(hyp_t_min, hs.front().first);
+            hyp_t_max = std::max(hyp_t_max, hs.back().first);
+          }
+          if (hyp_n >= 20) {
+            const double score_pos = score_pos_sum / hyp_n;
+            const double score_neg = score_neg_sum / hyp_n;
+            const double margin = score_pos - score_neg;
+            const double hyp_span = hyp_t_max - hyp_t_min;
+            int vote_sum = 0;
+            for (int v : ph_votes) vote_sum += v;
+            const bool hypothesis_lock = std::abs(margin) > 0.10;
+            const bool sustained_slope_lock = ph_votes.size() >= 7 && std::abs(vote_sum) >= 7;
+            if (ph_sign == 0 && hyp_span >= 8.0 && (hypothesis_lock || sustained_slope_lock)) {
+              ph_sign = hypothesis_lock ? (margin > 0 ? 1 : -1) : (vote_sum > 0 ? 1 : -1);
+              std::fill(std::begin(zsum), std::end(zsum), 0.0);
+              std::fill(std::begin(zn), std::end(zn), 0);
+              ph_cx = cx;
+              ph_cy = cy;
+              ph_zmid = zmid;
+              ph_geometry_frozen = true;
+            }
+            tools::logger()->info(
+              "[phase-hyp] n={} span={:.1f} R+={:.3f} R-={:.3f} margin={:.3f} sign={}",
+              hyp_n, hyp_span, score_pos, score_neg, margin, ph_sign);
+          }
+        }
+        double phi_use = phi_raw;
+        if (ph_sign != 0) {
+          // predict-and-fold filter: advance at the rulebook rate, fold the
+          // measurement onto the nearest 120° plate slot, correct softly.
+          if (ph_t < 0) {
+            ph_hat = phi_raw;
+          } else {
+            ph_hat += ph_sign * kOmegaBook * (t_now_s - ph_t);
+            double innov = wrap_rad(phi_raw - ph_hat);
+            innov = wrap_rad(std::fmod(innov + CV_PI / 3.0, 2.0 * CV_PI / 3.0) - CV_PI / 3.0);
+            ph_hat = wrap_rad(ph_hat + 0.02 * innov);
+          }
+          ph_t = t_now_s;
+          // this armor's own slot relative to the filtered phase
+          double slot = std::round(wrap_rad(phi_raw - ph_hat) / (2.0 * CV_PI / 3.0));
+          phi_use = wrap_rad(ph_hat + slot * 2.0 * CV_PI / 3.0);
+        }
+        // Fully model-consistent synthetic measurement: position snapped onto
+        // the rulebook ring at the filtered phase (raw transverse noise 0.1-
+        // 0.25m vs r=0.2765 otherwise fights the clean yaw inside the EKF and
+        // keeps NIS above the 40% reset gate).
+        const double center_x = ph_geometry_frozen ? ph_cx : cx;
+        const double center_y = ph_geometry_frozen ? ph_cy : cy;
+        const double center_z = ph_geometry_frozen ? ph_zmid : zmid;
+        Eigen::Vector3d pos{xr, yr, center_z};
+        if (ph_sign != 0) {
+          pos[0] = center_x + 0.2765 * std::cos(phi_use);
+          pos[1] = center_y + 0.2765 * std::sin(phi_use);
+        }
+        // Target::h_armor_xyz uses position = center - r*[cos(yaw),sin(yaw)],
+        // so its yaw is the INWARD normal (plate -> center).  phi_use is the
+        // outward ring phase (center -> plate); feeding it directly displaced
+        // the initialized center by 2r and made every update structurally
+        // inconsistent, producing the persistent high NIS/reset loop.
+        const double yaw_inward = wrap_rad(phi_use + CV_PI);
+        auto pts = solver.reproject_armor(pos, yaw_inward, armor.type, armor.name);
+        if (pts.size() == 4) {
+          for (int i = 0; i < 4; ++i) armor.points[i] = pts[i];
+          armor.xyz_in_world = pos;
+          armor.ypr_in_world = {yaw_inward, -15.0 * CV_PI / 180.0, 0};
+          armor.ypd_in_world = tools::xyz2ypd(pos);
+          armor.yaw_raw = yaw_inward;
+          armor.pose_override = true;
+        }
+      }
+      // Do not initialize/update the EKF with raw outpost poses while the
+      // random spin direction is still unobservable.  Those poses are exactly
+      // what previously seeded the filter with alternating +/-omega and high
+      // NIS.  The frame in which the vote first locks is also discarded so
+      // every measurement admitted to the tracker was synthesized under one
+      // consistent phase model from the start of that frame.
+      if (!phase_locked_at_frame_start) {
+        armors.clear();
+      } else {
+        // Never mix raw PnP and constrained synthetic poses in one tracker.
+        // A detection that failed center/radius/cluster validation above keeps
+        // pose_override=false and must wait for a later frame.
+        armors.remove_if([](const auto_aim::Armor & a) { return !a.pose_override; });
+      }
+    }
+    auto targets = tracker.track(armors, t);
+
+    double bullet_speed = link.attr(sentry, ga::kShooterRealSpeed).value_or(0) / 100.0;
+    if (bullet_speed < 14 || bullet_speed > 30) bullet_speed = 24.5;
+
+    auto command = aimer.aim(targets, t, bullet_speed);  // to_now=true, like standard.cpp
+    // Reprojection is diagnostic telemetry only. The bridge must not override
+    // the algorithm's command.control decision with a second state machine.
+    double reproj_error_px = 1e9;
+    double reproj_dx_px = 1e9, reproj_dy_px = 1e9;
+    if (!targets.empty() && !armors_ui.empty()) {
+      const auto model = targets.front().armor_xyza_list();
+      for (const auto & m : model) {
+        const auto pts = solver.reproject_armor(
+          m.head(3), m[3], targets.front().armor_type, targets.front().name);
+        if (pts.size() != 4) continue;
+        cv::Point2f mc(0.f, 0.f);
+        for (const auto & p : pts) mc += p;
+        mc *= 0.25f;
+        for (const auto & raw : armors_ui) {
+          if (raw.name != auto_aim::ArmorName::outpost) continue;
+          const double d = cv::norm(mc - raw.center);
+          if (d < reproj_error_px) {
+            reproj_error_px = d;
+            reproj_dx_px = std::abs(static_cast<double>(mc.x - raw.center.x));
+            reproj_dy_px = std::abs(static_cast<double>(mc.y - raw.center.y));
+          }
+        }
+      }
+    }
+    if (now - t_ekf_log > 1s) {  // EKF health: settles "is it converging/spinning"
+      t_ekf_log = now;
+      if (!targets.empty()) {
+        auto tf = targets.front();  // copy; convergened() mutates a cached flag
+        const auto & xs = tf.ekf_x();
+        double nis_fail = 0;
+        auto it = tf.ekf().data.find("recent_nis_failures");
+        if (it != tf.ekf().data.end()) nis_fail = it->second;
+        const double center_bearing = std::atan2(xs[2], xs[0]) * kRad2Deg;
+        const double center_distance = std::hypot(xs[0], xs[2]);
+        const double aim_bearing = aimer.debug_aim_point.valid
+                                     ? std::atan2(
+                                         aimer.debug_aim_point.xyza[1],
+                                         aimer.debug_aim_point.xyza[0]) *
+                                         kRad2Deg
+                                     : 999.0;
+        const double aim_distance = aimer.debug_aim_point.valid
+                                      ? std::hypot(
+                                          aimer.debug_aim_point.xyza[0],
+                                          aimer.debug_aim_point.xyza[1])
+                                      : -1.0;
+        double id0_width = -1.0, id0_height = -1.0;
+        const auto model_armors = tf.armor_xyza_list();
+        if (!model_armors.empty()) {
+          const auto id0_pts = solver.reproject_armor(
+            model_armors[0].head(3), model_armors[0][3], tf.armor_type, tf.name);
+          if (id0_pts.size() == 4) {
+            id0_width = 0.5 *
+                        (cv::norm(id0_pts[0] - id0_pts[1]) +
+                         cv::norm(id0_pts[3] - id0_pts[2]));
+            id0_height = 0.5 *
+                         (cv::norm(id0_pts[0] - id0_pts[3]) +
+                          cv::norm(id0_pts[1] - id0_pts[2]));
+          }
+        }
+        double aim_angle = 999.0, aim_width = -1.0, aim_height = -1.0;
+        if (aimer.debug_aim_point.valid) {
+          aim_angle = aimer.debug_aim_point.xyza[3] * kRad2Deg;
+          const auto aim_pts = solver.reproject_armor(
+            aimer.debug_aim_point.xyza.head(3), aimer.debug_aim_point.xyza[3],
+            tf.armor_type, tf.name);
+          if (aim_pts.size() == 4) {
+            aim_width = 0.5 *
+                        (cv::norm(aim_pts[0] - aim_pts[1]) +
+                         cv::norm(aim_pts[3] - aim_pts[2]));
+            aim_height = 0.5 *
+                         (cv::norm(aim_pts[0] - aim_pts[3]) +
+                          cv::norm(aim_pts[1] - aim_pts[2]));
+          }
+        }
+        tools::logger()->info(
+          "[ekf] a={:.1f} w={:.2f} r={:.3f} z=[{:.3f},{:.3f},{:.3f}] cd={:.2f} cb={:.1f} "
+          "id0_wh={:.1f}x{:.1f} aim_d={:.2f} aim_b={:.1f} aim_a={:.1f} "
+          "aim_wh={:.1f}x{:.1f} reproj_xy={:.1f}/{:.1f}px "
+          "zmap=[{:.3f}/{},{:.3f}/{},{:.3f}/{}] state={} conv={} nis_fail={:.2f} "
+          "det[r/b/e/p]={}/{}/{}/{}",
+          xs[6] * kRad2Deg, xs[7], xs[8],
+          model_armors.size() > 0 ? model_armors[0][2] : xs[4],
+          model_armors.size() > 1 ? model_armors[1][2] : xs[4],
+          model_armors.size() > 2 ? model_armors[2][2] : xs[4],
+          center_distance, center_bearing, id0_width,
+          id0_height, aim_distance, aim_bearing, aim_angle, aim_width, aim_height, reproj_dx_px,
+          reproj_dy_px, zn[0] ? zsum[0] / zn[0] : 0.0, zn[0],
+          zn[1] ? zsum[1] / zn[1] : 0.0, zn[1], zn[2] ? zsum[2] / zn[2] : 0.0, zn[2],
+          tracker.state(), tf.convergened(), nis_fail, det_color_hist[0], det_color_hist[1],
+          det_color_hist[2], det_color_hist[3]);
+      } else {
+        tools::logger()->info(
+          "[ekf] no-target state={} det[r/b/e/p]={}/{}/{}/{}", tracker.state(),
+          det_color_hist[0], det_color_hist[1], det_color_hist[2], det_color_hist[3]);
+      }
+    }
+
+    if (!targets.empty()) {
+      const auto & xs = targets.front().ekf_x();
+      last_cx = xs[0];
+      last_cy = xs[2];
+      last_a = xs[6];
+      last_target_ok = true;
+    } else {
+      last_target_ok = false;
+    }
+
+    // ---- OBSERVE mode: sweep bench — no aiming/fire commands at all ----
+    if (mode_observe) {
+      auto obs_now = std::chrono::steady_clock::now();
+      if (sweep_idx < sweep.size()) {
+        if (!sweep_phase_started) {
+          const auto & p = sweep[sweep_idx];
+          if (!p.camera.empty()) link.apply_camera(p.camera);
+          if (!p.exec.empty()) {  // '|'-separated console commands
+            std::string rest = p.exec;
+            size_t bar;
+            while ((bar = rest.find('|')) != std::string::npos) {
+              link.exec(rest.substr(0, bar));
+              rest = rest.substr(bar + 1);
+            }
+            if (!rest.empty()) link.exec(rest);
+          }
+          std::this_thread::sleep_for(2500ms);  // settle render/exposure
+          sweep_t0 = std::chrono::steady_clock::now();
+          sw_frames = sw_det = 0;
+          sw_conf = sw_width = 0;
+          sweep_phase_started = true;
+          tools::logger()->info("[sweep] >>> {}", p.name);
+        } else {
+          sw_frames++;
+          if (!armors_ui.empty()) {
+            sw_det++;
+            const auto & a = armors_ui.front();
+            sw_conf += a.confidence;
+            sw_width += (cv::norm(a.points[0] - a.points[1]) +
+                         cv::norm(a.points[3] - a.points[2])) /
+                        2.0;
+            // Per-frame plate-yaw time series: is the PnP plate normal (the
+            // EKF's rotation measurement) actually rotating? Settles whether
+            // omega-unobservability is structural (solver tilt-model mismatch)
+            // or pixel-starved. Uses the first solved armor.
+            if (rec_fp && !armors.empty() && armors.front().xyz_in_world.norm() > 0.1) {
+              const auto & m = armors.front();
+              std::fprintf(
+                rec_fp,
+                "{\"t\":%.3f,\"phase\":\"%s\",\"ypr0\":%.4f,\"yaw_raw\":%.4f,"
+                "\"bearing\":%.4f,\"dist\":%.3f,\"z\":%.3f,\"conf\":%.2f}\n",
+                frame.t_present, sweep[sweep_idx].name.c_str(), m.ypr_in_world[0], m.yaw_raw,
+                std::atan2(m.xyz_in_world[1], m.xyz_in_world[0]),
+                std::hypot(m.xyz_in_world[0], m.xyz_in_world[1]), m.xyz_in_world[2],
+                m.confidence);
+            }
+          }
+          if (!targets.empty()) sw_last_w = targets.front().ekf_x()[7];
+          sw_last_state = tracker.state();
+          if (std::chrono::duration<double>(obs_now - sweep_t0).count() >= sweep[sweep_idx].secs) {
+            tools::logger()->info(
+              "[sweep] <<< {} det_rate={:.3f} conf={:.2f} width_px={:.1f} n={} "
+              "ekf_w={:.2f} state={} img={}x{}",
+              sweep[sweep_idx].name, sw_frames ? 1.0 * sw_det / sw_frames : 0,
+              sw_det ? sw_conf / sw_det : 0, sw_det ? sw_width / sw_det : 0, sw_det, sw_last_w,
+              sw_last_state, cap.width(), cap.height());
+            if (rec_fp)
+              std::fprintf(
+                rec_fp,
+                "{\"phase\":\"%s\",\"det_rate\":%.4f,\"conf\":%.3f,\"width_px\":%.1f,"
+                "\"n\":%d,\"ekf_w\":%.3f,\"state\":\"%s\",\"w\":%d,\"h\":%d}\n",
+                sweep[sweep_idx].name.c_str(), sw_frames ? 1.0 * sw_det / sw_frames : 0,
+                sw_det ? sw_conf / sw_det : 0, sw_det ? sw_width / sw_det : 0, sw_det, sw_last_w,
+                sw_last_state.c_str(), cap.width(), cap.height());
+            std::fflush(rec_fp);
+            sweep_idx++;
+            sweep_phase_started = false;
+          }
+        }
+      } else if (!sweep.empty()) {
+        tools::logger()->info("[observe] sweep complete");
+        break;
+      }
+      // debug window still updates below; skip all turret/fire command paths
+    }
+
+    bool fire = false;
+    if (mode_observe) {
+      // no commands in observe mode
+    }
+    if (!mode_observe && command.control) {
+      Eigen::Vector3d gimbal_pos{tyaw, tpitch, 0};
+      fire = allow_fire && shooter.shoot(command, aimer, targets, gimbal_pos);
+      double ue_pitch_up_deg = -command.pitch * kRad2Deg;  // aimer is down-positive
+      // z-adapter correction: the aimer's plate z is the EKF's single height;
+      // replace with the learned height of the SPECIFIC plate it chose.
+      if (z_adapter && !targets.empty() && aimer.debug_aim_point.valid) {
+        const auto & xs = targets.front().ekf_x();
+        const auto & ap = aimer.debug_aim_point.xyza;
+        double horiz = std::hypot(ap[0], ap[1]);
+        double lead_s = cfg_delay + horiz / bullet_speed;
+        int ka = phase_bucket(ap[3] - (xs[6] + xs[7] * lead_s));
+        bool omega_locked = std::abs(std::abs(xs[7]) - 2.513) < 0.13;
+        if (omega_locked && zn[ka] >= 8 && horiz > 0.5) {
+          double dz = zsum[ka] / zn[ka] - ap[2];
+          ue_pitch_up_deg += std::atan2(dz, horiz) * kRad2Deg;
+        }
+      }
+      const double cmd_yaw_deg_internal = command.yaw * kRad2Deg;
+      const double cmd_yaw_deg = -cmd_yaw_deg_internal;  // RH sp_vision -> LH UE
+      const double cmd_pitch_deg = ue_pitch_up_deg;
+      link.exec(fmt::format(
+        "UEExec RBExtAim 0 {:.2f} {:.2f} {}", cmd_yaw_deg, cmd_pitch_deg, fire ? 1 : 0));
+      cmds++;
+      if (fire) shots++;
+      last_cmd = command;
+    }
+
+    // ---------- sp_vision's own debug window (auto_aim_test.cpp style) ----------
+    if (ui_quit) break;
+    cv::Mat img = frame.img;  // annotate in place; frame is a deep copy already
+    // Raw yolo verdicts, same labels as the original "detection" window
+    // (yolo11.cpp draw_detections: conf color name type) — drawn from the
+    // pre-track snapshot so filtered/misclassified plates stay visible.
+    for (const auto & a : armors_ui) {
+      std::vector<cv::Point2f> pts(a.points.begin(), a.points.end());
+      tools::draw_points(img, pts, {255, 200, 0});
+      tools::draw_text(
+        img,
+        fmt::format("{:.2f} {} {} {}", a.confidence, auto_aim::COLORS[a.color],
+                    auto_aim::ARMOR_NAMES[a.name], auto_aim::ARMOR_TYPES[a.type]),
+        {static_cast<int>(a.center.x) - 40, static_cast<int>(a.center.y) - 14},
+        {255, 200, 0}, 0.5);
+    }
+    tools::draw_text(
+      img,
+      fmt::format(
+        "command {} yaw{:.2f} pitch{:.2f} shoot:{}", command.control, -command.yaw * 57.3,
+        command.pitch * 57.3, fire),
+      {10, 60}, {154, 50, 205});
+    tools::draw_text(
+      img, fmt::format("turret yaw{:.2f} pitch{:.2f} v{:.1f}", tyaw_ue * 57.3, tpitch * 57.3,
+                       bullet_speed),
+      {10, 90}, {255, 255, 255});
+    tools::draw_text(
+      img,
+      fmt::format("state:{} det:{}/{} hp:{:.0f} allow:{:.0f} shots:{}",
+                  tracker.state(), det_frames, frames, hp, allow, shots),
+      {10, 120}, {0, 255, 255});
+
+    if (!targets.empty()) {
+      auto target = targets.front();
+      const auto & tx = target.ekf_x();
+      for (Eigen::Vector4d xyza : target.armor_xyza_list()) {
+        const int k = phase_bucket(xyza[3] - tx[6]);
+        if (zn[k] >= 8) xyza[2] = zsum[k] / zn[k];
+        auto image_points =
+          solver.reproject_armor(xyza.head(3), xyza[3], target.armor_type, target.name);
+        tools::draw_points(img, image_points, {0, 255, 0});
+      }
+      auto aim_point = aimer.debug_aim_point;
+      if (aim_point.valid) {
+        Eigen::Vector4d draw_aim = aim_point.xyza;
+        double horiz = std::hypot(draw_aim[0], draw_aim[1]);
+        double lead_s = cfg_delay + horiz / bullet_speed;
+        int k = phase_bucket(draw_aim[3] - (tx[6] + tx[7] * lead_s));
+        if (zn[k] >= 8) draw_aim[2] = zsum[k] / zn[k];
+        auto image_points = solver.reproject_armor(
+          draw_aim.head(3), draw_aim[3], target.armor_type, target.name);
+        tools::draw_points(img, image_points, {0, 0, 255});
+      }
+      const auto & x = target.ekf_x();
+      tools::draw_text(
+        img, fmt::format("ekf w{:.2f} r{:.3f} d{:.2f}", x[7], x[8],
+                         std::hypot(x[0], x[2])),
+        {10, 150}, {0, 255, 0});
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(ui_mu);
+      img.copyTo(ui_frame);  // hand off to the UI thread (latest-wins mailbox)
+    }
+    if (dump_ui_every > 0 && frames % dump_ui_every == 0)
+      cv::imwrite(fmt::format("ui_dump/ui_{:06d}.jpg", frames), img);
+
+    if (now - t_log > 5s) {
+      t_log = now;
+      auto t_frame_end = std::chrono::steady_clock::now();
+      tools::logger()->info(
+        "[gestalt] frames={} det={} cmds={} shots={} hp={:.0f} allow={:.0f} "
+        "det_ms={:.0f} post_ms={:.0f} grab_avg={:.0f} rej_avg={:.0f} rej_n={}",
+        frames, det_frames, cmds, shots, hp, allow,
+        std::chrono::duration<double, std::milli>(t_det1 - t_det0).count(),
+        std::chrono::duration<double, std::milli>(t_frame_end - t_det1).count(),
+        grab_n ? grab_acc / grab_n : 0, rej_n ? rej_acc / rej_n : 0, rej_n);
+      grab_acc = rej_acc = 0;
+      grab_n = rej_n = 0;
+    }
+  }
+
+  ui_quit = true;
+  if (ui_thread.joinable()) ui_thread.join();
+
+  const double hp_final = outpost > 0 ? link.attr(outpost, ga::kHealth).value_or(0) : -1;
+  const double allow_final = link.attr(sentry, ga::kAllowance17mm).value_or(0);
+  const double used = allow0 - allow_final;
+  const double hits = (hp0 - hp_final) / 20.0;
+  link.exec("ExtAimClaim 0 0");
+  tools::logger()->info(
+    "[gestalt] RESULT={} hp {}->{} damaging_hits={} bullets={} hit_rate={:.3f} "
+    "frames={} det_rate={:.3f}",
+    hp_final == 0 ? "DESTROYED" : "PARTIAL", hp0, hp_final, hits, used,
+    used > 0 ? hits / used : 0.0, frames, frames > 0 ? 1.0 * det_frames / frames : 0.0);
+  return hp_final == 0 ? 0 : 2;
+}

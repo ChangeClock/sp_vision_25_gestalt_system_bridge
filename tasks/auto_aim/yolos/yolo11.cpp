@@ -25,6 +25,11 @@ YOLO11::YOLO11(const std::string & config_path, bool debug)
   width = yaml["roi"]["width"].as<int>();
   height = yaml["roi"]["height"].as<int>();
   use_roi_ = yaml["use_roi"].as<bool>();
+  // The simulator's hero plate renders the digit "1" correctly, but this
+  // model can emit only the otherwise-invalid one/small class for it. Keep
+  // real-camera behavior unchanged unless a simulator config opts in.
+  if (yaml["sim_one_as_big"])
+    sim_one_as_big_ = yaml["sim_one_as_big"].as<bool>();
   roi_ = cv::Rect(x, y, width, height);
   offset_ = cv::Point2f(x, y);
 
@@ -160,6 +165,9 @@ std::list<Armor> YOLO11::parse(
       it = armors.erase(it);
       continue;
     }
+
+    if (sim_one_as_big_ && it->name == ArmorName::one && it->type == ArmorType::small)
+      it->type = ArmorType::big;
 
     if (!check_type(*it)) {
       it = armors.erase(it);

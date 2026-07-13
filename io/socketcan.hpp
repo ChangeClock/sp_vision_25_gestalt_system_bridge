@@ -1,6 +1,35 @@
 #ifndef IO__SOCKETCAN_HPP
 #define IO__SOCKETCAN_HPP
 
+#ifdef _WIN32
+// Windows stub: cboard.hpp (pulled in by auto_aim/aimer.hpp) needs the
+// can_frame type and a complete SocketCAN declaration to PARSE, but the
+// gestalt bridge never constructs CBoard, so none of this executes. Keeping
+// the stub here (an io/ file) leaves tasks/auto_aim byte-identical.
+#include <cstdint>
+#include <functional>
+#include <string>
+
+struct can_frame
+{
+  uint32_t can_id;
+  uint8_t can_dlc;
+  uint8_t data[8];
+};
+
+namespace io
+{
+class SocketCAN
+{
+public:
+  SocketCAN(const std::string &, std::function<void(const can_frame &)>) {}
+  void write(can_frame *) const {}
+};
+
+}  // namespace io
+
+#else  // !_WIN32
+
 #include <linux/can.h>
 #include <net/if.h>
 #include <sys/epoll.h>
@@ -155,5 +184,7 @@ private:
 };
 
 }  // namespace io
+
+#endif  // !_WIN32
 
 #endif  // IO__SOCKETCAN_HPP

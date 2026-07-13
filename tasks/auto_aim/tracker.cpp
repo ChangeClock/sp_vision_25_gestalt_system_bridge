@@ -23,6 +23,9 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   min_detect_count_ = yaml["min_detect_count"].as<int>();
   max_temp_lost_count_ = yaml["max_temp_lost_count"].as<int>();
   outpost_max_temp_lost_count_ = yaml["outpost_max_temp_lost_count"].as<int>();
+  max_frame_gap_ = yaml["max_frame_gap"].IsDefined()
+                     ? yaml["max_frame_gap"].as<double>()
+                     : 0.1;
   normal_temp_lost_count_ = max_temp_lost_count_;
 }
 
@@ -35,7 +38,7 @@ std::list<Target> Tracker::track(
   last_timestamp_ = t;
 
   // 时间间隔过长，说明可能发生了相机离线
-  if (state_ != "lost" && dt > 0.1) {
+  if (state_ != "lost" && dt > max_frame_gap_) {
     tools::logger()->warn("[Tracker] Large dt: {:.3f}s", dt);
     state_ = "lost";
   }
@@ -81,6 +84,7 @@ std::list<Target> Tracker::track(
 
   // 收敛效果检测：
   if (
+    !target_pose_override_ &&
     std::accumulate(
       target_.ekf().recent_nis_failures.begin(), target_.ekf().recent_nis_failures.end(), 0) >=
     (0.4 * target_.ekf().window_size)) {
@@ -109,7 +113,7 @@ std::tuple<omniperception::DetectionResult, std::list<Target>> Tracker::track(
   last_timestamp_ = t;
 
   // 时间间隔过长，说明可能发生了相机离线
-  if (state_ != "lost" && dt > 0.1) {
+  if (state_ != "lost" && dt > max_frame_gap_) {
     tools::logger()->warn("[Tracker] Large dt: {:.3f}s", dt);
     state_ = "lost";
   }
@@ -233,7 +237,8 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
   if (armors.empty()) return false;
 
   auto & armor = armors.front();
-  solver_.solve(armor);
+  if (!armor.pose_override) solver_.solve(armor);
+  target_pose_override_ = armor.pose_override;
 
   // 根据兵种优化初始化参数
   auto is_balance = (armor.type == ArmorType::big) &&
@@ -284,7 +289,7 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     )
       continue;
 
-    solver_.solve(armor);
+    if (!armor.pose_override) solver_.solve(armor);
 
     target_.update(armor);
   }

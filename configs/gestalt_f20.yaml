@@ -1,0 +1,64 @@
+# gestalt UE-simulator bridge config — original sp_vision auto_aim chain,
+# GameIO backend (DXGI window capture + WS console). See io/gestalt/.
+
+enemy_color: "red"          # shoot the RED outpost (yolo11 class 19)
+
+#####----- detector / yolo -----#####
+yolo_name: yolo11
+yolo11_model_path: assets/yolo11.xml
+classify_model: assets/tiny_resnet.onnx
+device: CPU                 # GPU plugin gives zero detections on this IR; CPU + game fps cap instead
+min_confidence: 0.4
+roi: { x: 0, y: 0, width: -1, height: -1 }
+use_roi: false
+
+# traditional-detector keys — required by construction, inert on the yolo path:
+threshold: 150
+max_angle_error: 45
+min_lightbar_ratio: 1.5
+max_lightbar_ratio: 20
+min_lightbar_length: 8
+min_armor_ratio: 1
+max_armor_ratio: 5
+max_side_ratio: 1.5
+max_rectangular_error: 25
+
+#####----- tracker -----#####
+min_detect_count: 3
+max_temp_lost_count: 15
+outpost_max_temp_lost_count: 75
+
+#####----- aimer -----#####
+yaw_offset: 0
+pitch_offset: 0
+comming_angle: 60           # NOTE the double-m spelling (source key)
+leaving_angle: 20           # outpost overrides to 70/30 in aimer.cpp anyway
+decision_speed: 8
+# TOTAL-DELAY calibration slot (the sp_vision per-robot "总延迟" procedure).
+# Outpost omega 2.513 < decision_speed → LOW slot is the active one.
+# Bridge loop estimate: capture(~1 frame) + inference + WS + 30Hz tick ≈ 0.08s;
+# sweep 0.03..0.15 against damage-per-20-rounds to calibrate.
+high_speed_delay_time: 0.20
+low_speed_delay_time: 0.20
+
+#####----- shooter -----#####
+first_tolerance: 3
+second_tolerance: 2
+judge_distance: 2
+auto_fire: true
+
+#####----- geometry (OpenCV cam → UE world; dossier §2) -----#####
+R_gimbal2imubody: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+# canonical OpenCV(x-right,y-down,z-fwd) → UE-world(X-fwd,Y-right,Z-up)
+# proper RH rotation (det +1): cam-x→−Y(left), cam-y→−Z, cam-z→+X
+R_camera2gimbal:  [0, 0, 1, -1, 0, 0, 0, -1, 0]
+t_camera2gimbal:  [0, 0, 0]
+
+#####----- camera intrinsics (ideal UE pinhole) -----#####
+# W=1280, FOV_h=45° → fx=fy=(1280/2)/tan(22.5°)=1545.10 ; cx=W/2=640
+# cy = FULL client height/2 = 720/2 = 360 (frame is bottom-cropped 28px AFTER
+# the optical center is fixed — do NOT use cropped_h/2; ~0.44° pitch bias).
+camera_matrix: [1545.10, 0, 640.0, 0, 1545.10, 360.0, 0, 0, 1]
+distort_coeffs: [0, 0, 0, 0, 0]
+sim_quad_scale: 1.192
+z_adapter: true

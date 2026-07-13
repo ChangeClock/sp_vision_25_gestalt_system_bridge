@@ -13,3 +13,19 @@ testvideos/
 watchdog.sh
 records_24/
 records_25/
+
+# Gestalt simulator bridge runtime/diagnostic outputs
+/ui_dump/
+/spin3_results/
+/detect_annot/
+/outpost_cal_debug/
+/outpost_debug_s120/
+/debug_*_live.png
+/gestalt_record.jsonl
+/detect_results.jsonl
+/outpost_benchmark_s120.jsonl
+/outpost_calibration.jsonl
+/p0_shared_*.log
+/session_cmd.json
+/session_status.json
+/tools/__pycache__/

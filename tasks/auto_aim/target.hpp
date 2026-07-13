@@ -2,6 +2,7 @@
 #define AUTO_AIM__TARGET_HPP
 
 #include <Eigen/Dense>
+#include <array>
 #include <chrono>
 #include <optional>
 #include <queue>
@@ -52,10 +53,26 @@ private:
 
   bool is_switch_, is_converged_;
 
+  // The 2026 outpost has three plates at fixed, staggered heights.  The EKF's
+  // angular id is only defined up to a cyclic shift (and the simulator/world
+  // handedness may reverse the baked order), so select one of the six possible
+  // id-to-height permutations from the visual measurements before enabling the
+  // rigid-height model.
+  bool outpost_height_model_locked_ = false;
+  int outpost_height_hypothesis_ = -1;
+  int outpost_height_updates_ = 0;
+  unsigned outpost_seen_id_mask_ = 0;
+  std::array<int, 6> outpost_hyp_count_{};
+  std::array<double, 6> outpost_hyp_mean_{};
+  std::array<double, 6> outpost_hyp_m2_{};
+
   tools::ExtendedKalmanFilter ekf_;
   std::chrono::steady_clock::time_point t_;
 
   void update_ypda(const Armor & armor, int id);  // yaw pitch distance angle
+
+  void update_outpost_height_model(const Armor & armor, int id);
+  double outpost_height_offset(int id) const;
 
   Eigen::Vector3d h_armor_xyz(const Eigen::VectorXd & x, int id) const;
   Eigen::MatrixXd h_jacobian(const Eigen::VectorXd & x, int id) const;

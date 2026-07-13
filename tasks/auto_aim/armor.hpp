@@ -97,6 +97,9 @@ struct Armor
   cv::Mat pattern;
   double confidence;
   bool duplicated;
+  // Optional pre-solved pose supplied by a sensor/bridge adapter.  False for
+  // every normal detector path, preserving the original solvePnP behavior.
+  bool pose_override = false;
 
   Eigen::Vector3d xyz_in_gimbal;  // 单位：m
   Eigen::Vector3d xyz_in_world;   // 单位：m

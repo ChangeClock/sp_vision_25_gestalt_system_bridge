@@ -26,7 +26,7 @@ public:
 private:
   std::string device_, model_path_;
   std::string save_path_, debug_path_;
-  bool debug_, use_roi_;
+  bool debug_, use_roi_, sim_one_as_big_ = false;
 
   const int class_num_ = 38;
   const float nms_threshold_ = 0.3;

@@ -160,7 +160,10 @@ AimPoint Aimer::choose_aim_point(const Target & target)
   }
 
   // 不考虑小陀螺
-  if (std::abs(target.ekf_x()[8]) <= 2 && target.name != ArmorName::outpost) {
+  // x[7] is omega; x[8] is the ring RADIUS (diverged() clamps it to [0.05,0.5],
+  // so the original |x[8]|<=2 test was always true and the spin-prediction
+  // branch below was dead code for every non-outpost target).
+  if (std::abs(target.ekf_x()[7]) <= 2 && target.name != ArmorName::outpost) {
     // 选择在可射击范围内的装甲板
     std::vector<int> id_list;
     for (int i = 0; i < armor_num; i++) {
