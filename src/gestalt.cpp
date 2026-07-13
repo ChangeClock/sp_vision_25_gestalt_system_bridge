@@ -216,6 +216,7 @@ int main(int argc, char ** argv)
   int bench_target_hp = 0;                        // >0: boost so the round can't kill it
   double bench_damage_per_hit = 20.0;             // HP per damaging 17mm hit
   double bench_boot_pitch = 10.0;                 // outpost drum sits high; ground cars: 0
+  bool bench_match = false;  // live-match takeover: claim the match sentry, no spawn/drive
   try {
     auto yroot = YAML::LoadFile(config);
     auto ystr = [&](const char * k, std::string & dst) {
@@ -244,9 +245,10 @@ int main(int argc, char ** argv)
       bench_damage_per_hit = yroot["bench_damage_per_hit"].as<double>();
     if (yroot["bench_boot_pitch"].IsDefined())
       bench_boot_pitch = yroot["bench_boot_pitch"].as<double>();
+    if (yroot["bench_match"].IsDefined()) bench_match = yroot["bench_match"].as<bool>();
   } catch (...) {
   }
-  const bool bench_vehicle = bench_target == "vehicle";
+  const bool bench_vehicle = !bench_match && bench_target == "vehicle";
 
   io::gestalt::GameLink link(port);
   if (!wait_for([&] { return link.connected(); }, 10)) {
@@ -255,6 +257,48 @@ int main(int argc, char ** argv)
   }
   std::this_thread::sleep_for(2s);  // let the initial attribute sweep land
 
+  int sentry = -1;   // attribute-map id of the vehicle whose turret we drive
+  int ext_pid = 0;   // player id addressed by RBExtAim/ExtAimClaim (bench: pid 0)
+  int outpost = -1;
+
+  if (bench_match) {
+    // ---------- LIVE-MATCH takeover ----------
+    // Claim the match-owned blue sentry's turret + fire; chassis and economy
+    // stay with the built-in AI (AIMoveMode/allowance untouched). ExtAimClaim
+    // re-asserts AITargetMode=90 after every strategy tick, so the claim
+    // survives the coach for the whole match.
+    if (!wait_for(
+          [&] {
+            auto m = link.find_vehicle(bench_shooter_class, 1);
+            if (!m) return false;
+            sentry = *m;
+            return link.attr(sentry, ga::kPlayerId).has_value();
+          },
+          180)) {
+      tools::logger()->error(
+        "[gestalt] no live blue sentry (class {}) appeared in the match", bench_shooter_class);
+      return 1;
+    }
+    ext_pid = static_cast<int>(link.attr(sentry, ga::kPlayerId).value_or(-1));
+    if (ext_pid < 0) {
+      tools::logger()->error("[gestalt] match sentry map={} has no player id", sentry);
+      return 1;
+    }
+    outpost = link.find_red_outpost().value_or(-1);
+    tools::logger()->info(
+      "[gestalt] match takeover: sentry map={} pid={} hp={}", sentry, ext_pid,
+      link.attr(sentry, ga::kHealth).value_or(-1));
+    link.exec(fmt::format("ExtAimClaim {} 1", ext_pid));
+    link.exec(fmt::format("UEExec RBTakeOver {}", ext_pid));  // viewport = its gun view
+    link.exec("UEExec r.MotionBlurQuality 0");
+    link.exec("UEExec r.AntiAliasingMethod 1");
+    link.exec("UEExec r.RobotNav.DebugDraw 0");
+    link.exec("UEExec t.MaxFPS 30");
+    link.exec("UEExec r.VisionBridge.Enable 1");
+    std::this_thread::sleep_for(2s);
+    link.apply_camera(camera_json);
+    std::this_thread::sleep_for(1500ms);
+  } else {
   // ---------- prep-stage setup (mirrors tools/outpost_benchmark.py) ----------
   if (do_setup) {
     // Boot-readiness: the TS console isn't instantly live after the WS opens —
@@ -288,7 +332,7 @@ int main(int argc, char ** argv)
     tools::logger()->error("[gestalt] no live pid-0 vehicle in telemetry");
     return 1;
   }
-  const int sentry = *sentry_opt;
+  sentry = *sentry_opt;
   if (
     static_cast<int>(link.attr(sentry, ga::kClass).value_or(-1)) != bench_shooter_class ||
     static_cast<int>(link.attr(sentry, ga::kTeamId).value_or(-1)) != 1) {
@@ -304,7 +348,7 @@ int main(int argc, char ** argv)
       return op && link.attr(*op, ga::kHealth).value_or(0) > 0;
     },
     30);
-  const int outpost = link.find_red_outpost().value_or(-1);
+  outpost = link.find_red_outpost().value_or(-1);
   tools::logger()->info(
     "[gestalt] sentry map={} outpost map={} outpost_hp={}", sentry, outpost,
     outpost > 0 ? link.attr(outpost, ga::kHealth).value_or(-1) : -1);
@@ -511,10 +555,12 @@ int main(int argc, char ** argv)
     link.apply_camera(camera_json);
     std::this_thread::sleep_for(1500ms);
   }
+  }  // !bench_match (bench setup)
 
   // HP probe: the entity whose health decides hits/exit. Vehicle rounds read
-  // the RBNavLab target's map; the classic bench keeps the red outpost.
-  int probe = outpost;
+  // the RBNavLab target's map; the classic bench keeps the red outpost; match
+  // takeover watches OUR OWN sentry (exit on its death = survival semantics).
+  int probe = bench_match ? sentry : outpost;
   if (bench_vehicle) {
     const auto tmap = link.find_player(bench_target_pid);
     if (!tmap) {
@@ -642,6 +688,12 @@ int main(int argc, char ** argv)
   });
 
   io::Command last_cmd{false, false, 0, 0};
+  // Match-mode idle scan: sweep the turret when the aimer has produced no
+  // solution for a while, freezing whenever raw detections appear.
+  constexpr double kScanAfterLostSec = 2.0, kScanRateDegS = 60.0, kScanPitchDeg = 0.0;
+  double scan_yaw_deg = 0.0;
+  bool scan_active = false;
+  auto t_last_ctrl = std::chrono::steady_clock::now();
   int frames = 0, det_frames = 0, cmds = 0, fire_cmds = 0, grab_fail = 0;
   // Per-hit damage calibration: histogram of discrete HP drops observed on the
   // probe (logged at RESULT so bench_damage_per_hit can be verified per target).
@@ -724,7 +776,10 @@ int main(int argc, char ** argv)
     if (hp > 0) hp_seen = true;
     // Only honor hp==0 after a live reading: at boot the attribute may simply
     // not have arrived yet (value_or(0) — the 0.12-sweep instant-exit race).
-    if ((hp_seen && hp == 0) || (hp_seen && allow <= 0)) break;
+    if ((hp_seen && hp == 0) || (!bench_match && hp_seen && allow <= 0)) break;
+    // Match takeover: economy belongs to the built-in AI (allowance may dip to
+    // 0 until it re-buys), so only our own death or a settled match ends the run.
+    if (bench_match && link.match_status() >= 2) break;
 
     auto now = std::chrono::steady_clock::now();
 
@@ -1388,10 +1443,27 @@ int main(int argc, char ** argv)
       const double cmd_yaw_deg = -cmd_yaw_deg_internal;  // RH sp_vision -> LH UE
       const double cmd_pitch_deg = ue_pitch_up_deg;
       link.exec(fmt::format(
-        "UEExec RBExtAim 0 {:.2f} {:.2f} {}", cmd_yaw_deg, cmd_pitch_deg, fire ? 1 : 0));
+        "UEExec RBExtAim {} {:.2f} {:.2f} {}", ext_pid, cmd_yaw_deg, cmd_pitch_deg,
+        fire ? 1 : 0));
       cmds++;
       if (fire) fire_cmds++;
       last_cmd = command;
+      t_last_ctrl = now;
+      scan_active = false;
+    } else if (bench_match && !mode_observe) {
+      const double lost_s = std::chrono::duration<double>(now - t_last_ctrl).count();
+      if (lost_s > kScanAfterLostSec) {
+        if (!scan_active) {
+          scan_yaw_deg = link.attr(sentry, ga::kTurretYaw).value_or(0.0);
+          scan_active = true;
+        }
+        if (armors.empty()) scan_yaw_deg += kScanRateDegS / 30.0;  // ~per-frame at 30fps
+        scan_yaw_deg = std::remainder(scan_yaw_deg, 360.0);
+        link.exec(fmt::format(
+          "UEExec RBExtAim {} {:.1f} {:.1f} 0 {:.0f}", ext_pid, scan_yaw_deg, kScanPitchDeg,
+          armors.empty() ? kScanRateDegS : 0.0));
+        cmds++;
+      }
     }
 
     // ---------- sp_vision's own debug window (auto_aim_test.cpp style) ----------
@@ -1487,7 +1559,7 @@ int main(int argc, char ** argv)
   const double used =
     bf_final ? std::max(0.0, *bf_final - fired0) : std::max(0.0, allow0 - allow_final);
   const double hits = (hp0 - hp_final) / bench_damage_per_hit;
-  link.exec("ExtAimClaim 0 0");
+  link.exec(fmt::format("ExtAimClaim {} 0", ext_pid));
   if (bench_vehicle) {
     // Teardown: never kill the target — a corpse keeps extinguished-but-
     // detectable plates at the test point and poisons the next round's EKF
