@@ -17,11 +17,12 @@
 # rides a ±15° triangle wave (spiral coverage — low targets under the muzzle
 # line are invisible to a level-only sweep), freezing both axes while raw
 # detections are present so the tracker can lock; the freeze target is the
-# current telemetry pose, never the previous scan target. On death: heartbeat
-# renewal stops and revival is the
-# game's own business — the bridge only shows the live revive progress and
-# re-asserts claim + gun view once the game brings a strictly newer map back,
-# then repeats identity + mode/frame/FOV/armLength/RBExtAim effect gates. WS or
+# current telemetry pose, never the previous scan target. On death, heartbeat
+# renewal stops, an explicit release is sent, and revival remains the game's
+# own business. The bridge only shows live revive progress and re-asserts claim
+# + gun view after HP returns on the same map (in-place revive) or a newer map,
+# then repeats identity + physical-ready + mode/frame/FOV/armLength/RBExtAim
+# effect gates. WS or
 # capture recovery likewise requires claim + takeover + camera + the full gate;
 # otherwise the run fails safely. Pixel capture is pinned to the process that
 # owns the requested WS listener port, so another UE publisher cannot be mixed
