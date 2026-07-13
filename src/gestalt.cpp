@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -201,6 +202,52 @@ int main(int argc, char ** argv)
   } catch (...) {
   }
 
+  // ---- bench scenario knobs (external-aim playbook §6). Defaults reproduce
+  // the original Mario-vs-outpost far bench, so existing configs are untouched.
+  std::string bench_shooter_entity = "66000008";  // Mario assault infantry
+  int bench_shooter_class = 1003;                 // sentry bench: 66000012 / 1004
+  int bench_allowance = 300;                      // 17mm budget per round
+  std::string bench_target = "outpost";           // outpost | vehicle
+  int bench_target_pid = 92001;                   // RBNavLab player id of the target
+  std::string bench_target_spawn, bench_target_drive, bench_target_spin;
+  std::vector<double> bench_target_goal_cm;       // optional arrival ball (x,y cm)
+  double bench_target_goal_radius_cm = 70.0;      // hero-class chassis stop ~3m out: use 350
+  std::vector<double> bench_target_park_cm;       // optional teardown parking spot (x,y cm)
+  int bench_target_hp = 0;                        // >0: boost so the round can't kill it
+  double bench_damage_per_hit = 20.0;             // HP per damaging 17mm hit
+  double bench_boot_pitch = 10.0;                 // outpost drum sits high; ground cars: 0
+  try {
+    auto yroot = YAML::LoadFile(config);
+    auto ystr = [&](const char * k, std::string & dst) {
+      if (yroot[k].IsDefined()) dst = yroot[k].as<std::string>();
+    };
+    ystr("bench_shooter_entity", bench_shooter_entity);
+    if (yroot["bench_shooter_class"].IsDefined())
+      bench_shooter_class = yroot["bench_shooter_class"].as<int>();
+    if (yroot["bench_allowance"].IsDefined())
+      bench_allowance = yroot["bench_allowance"].as<int>();
+    ystr("bench_target", bench_target);
+    if (yroot["bench_target_pid"].IsDefined())
+      bench_target_pid = yroot["bench_target_pid"].as<int>();
+    ystr("bench_target_spawn", bench_target_spawn);
+    ystr("bench_target_drive", bench_target_drive);
+    ystr("bench_target_spin", bench_target_spin);
+    if (yroot["bench_target_goal_cm"].IsDefined())
+      bench_target_goal_cm = yroot["bench_target_goal_cm"].as<std::vector<double>>();
+    if (yroot["bench_target_goal_radius_cm"].IsDefined())
+      bench_target_goal_radius_cm = yroot["bench_target_goal_radius_cm"].as<double>();
+    if (yroot["bench_target_park_cm"].IsDefined())
+      bench_target_park_cm = yroot["bench_target_park_cm"].as<std::vector<double>>();
+    if (yroot["bench_target_hp"].IsDefined())
+      bench_target_hp = yroot["bench_target_hp"].as<int>();
+    if (yroot["bench_damage_per_hit"].IsDefined())
+      bench_damage_per_hit = yroot["bench_damage_per_hit"].as<double>();
+    if (yroot["bench_boot_pitch"].IsDefined())
+      bench_boot_pitch = yroot["bench_boot_pitch"].as<double>();
+  } catch (...) {
+  }
+  const bool bench_vehicle = bench_target == "vehicle";
+
   io::gestalt::GameLink link(port);
   if (!wait_for([&] { return link.connected(); }, 10)) {
     tools::logger()->error("[gestalt] WS connect failed :{}", port);
@@ -217,10 +264,10 @@ int main(int argc, char ** argv)
     const int previous_sentry = link.find_player(0).value_or(-1);
     bool spawned = false;
     for (int attempt = 0; attempt < 3 && !spawned; ++attempt) {
-      // Mario assault infantry has the more stable turret requested for the
-      // outpost bench. Team must be blue at spawn time so armor emissive color
-      // and detector class are correct.
-      link.exec("Respawn 0 66000008 1");
+      // Shooter chassis comes from the config (Mario 66000008 default; sentry
+      // bench uses 66000012). Team must be blue at spawn time so armor
+      // emissive color and detector class are correct.
+      link.exec(fmt::format("Respawn 0 {} 1", bench_shooter_entity));
       // Respawn is asynchronous.  An older alive sentry may remain in the
       // attribute cache, so merely finding class/team can return immediately
       // with stale map telemetry.  Wait for the newly allocated (higher) map.
@@ -243,10 +290,11 @@ int main(int argc, char ** argv)
   }
   const int sentry = *sentry_opt;
   if (
-    static_cast<int>(link.attr(sentry, ga::kClass).value_or(-1)) != 1003 ||
+    static_cast<int>(link.attr(sentry, ga::kClass).value_or(-1)) != bench_shooter_class ||
     static_cast<int>(link.attr(sentry, ga::kTeamId).value_or(-1)) != 1) {
     tools::logger()->error(
-      "[gestalt] pid-0 vehicle is not the blue Mario benchmark observer (map={})", sentry);
+      "[gestalt] pid-0 vehicle is not the expected blue shooter (map={} class={} want={})",
+      sentry, link.attr(sentry, ga::kClass).value_or(-1), bench_shooter_class);
     return 1;
   }
   double boot_bearing_deg = -83.3;  // outpost-lob point → red outpost, map-4 fallback
@@ -311,8 +359,8 @@ int main(int argc, char ** argv)
     link.exec("ExtAimClaim 0 1");
     link.exec("UEExec RBTakeOver 0");  // guarantee the viewport IS the gun view
     // Respawn does NOT refill the 17mm allowance (player-scoped) — reset it so
-    // every run starts with the full 300-round budget.
-    link.exec(fmt::format("SetAttribute 0 {} 300", ga::kAllowance17mm));
+    // every run starts with exactly the configured round budget.
+    link.exec(fmt::format("SetAttribute 0 {} {}", ga::kAllowance17mm, bench_allowance));
     // Motion blur smears the lightbars during turret slew (shutterSpeed only
     // drives exposure, not blur) — kill it for detection stability.
     link.exec("UEExec r.MotionBlurQuality 0");
@@ -328,20 +376,117 @@ int main(int argc, char ** argv)
     link.apply_camera(camera_json);
     std::this_thread::sleep_for(1500ms);
 
+    // ---- bench target (vehicle rounds): spawn → drive → arrive → boost → spin.
+    // The target is an RBNavLab car (own per-tick mode maintenance, not in the
+    // AiPlayerService table) so nothing here fights the match strategy.
+    if (bench_vehicle) {
+      // Idempotent rerun: if a LIVE car already owns this pid (earlier attempt
+      // left it standing), reuse it — re-spawning an occupied pid never yields
+      // the new map the guard below waits for.
+      const auto pre = link.find_player(bench_target_pid);
+      const bool target_alive = pre && link.attr(*pre, ga::kHealth).value_or(0) > 0;
+      if (!bench_target_spawn.empty() && !target_alive) {
+        // Same stale-corpse guard as the shooter spawn: a torn-down target from
+        // an earlier run leaves a FROZEN dead map under this pid — only accept
+        // a newly allocated (higher) map id.
+        const int prev_target = pre.value_or(-1);
+        link.exec(bench_target_spawn);
+        if (!wait_for(
+              [&] {
+                auto current = link.find_player(bench_target_pid);
+                return current && *current > prev_target &&
+                       link.attr(*current, ga::kHealth).value_or(0) > 0;
+              },
+              20)) {
+          tools::logger()->error(
+            "[gestalt] bench target pid={} did not appear as a NEW live map", bench_target_pid);
+          return 1;
+        }
+      }
+      const int tmap = link.find_player(bench_target_pid).value_or(-1);
+      if (tmap < 0) {
+        tools::logger()->error("[gestalt] no live bench target pid={}", bench_target_pid);
+        return 1;
+      }
+      if (!bench_target_drive.empty()) {
+        link.exec(bench_target_drive);
+        // Arrival: explicit goal → the same 70cm ball as the shooter drive;
+        // mode-style drives (fortress/deployment) have no coordinate here, so
+        // wait for the nav to settle (three consecutive 2s samples within 15cm).
+        auto t_tgt_end = std::chrono::steady_clock::now() + std::chrono::duration<double>(150);
+        double px = 1e9, py = 1e9;
+        int still = 0;
+        bool tgt_arrived = false;
+        while (std::chrono::steady_clock::now() < t_tgt_end) {
+          std::this_thread::sleep_for(2s);
+          auto x = link.attr(tmap, ga::kPosX), y = link.attr(tmap, ga::kPosY);
+          if (!x || !y) continue;
+          if (bench_target_goal_cm.size() >= 2) {
+            const double err =
+              std::hypot(*x - bench_target_goal_cm[0], *y - bench_target_goal_cm[1]);
+            tools::logger()->info(
+              "[gestalt] target drive pos=({:.2f},{:.2f})m error={:.2f}m", *x / 100.0,
+              *y / 100.0, err / 100.0);
+            if (err < bench_target_goal_radius_cm) {
+              tgt_arrived = true;
+              break;
+            }
+          } else {
+            still = std::hypot(*x - px, *y - py) < 15.0 ? still + 1 : 0;
+            px = *x;
+            py = *y;
+            if (still >= 3) {
+              tgt_arrived = true;
+              break;
+            }
+          }
+        }
+        if (!tgt_arrived) {
+          tools::logger()->error("[gestalt] invalid bench: target never reached its post");
+          return 2;
+        }
+      }
+      if (bench_target_hp > 0) {
+        // HealthMax clamps direct HP writes (observed: 5000 → stuck at the
+        // stock 150) — raise the ceiling first, then the health.
+        link.exec(fmt::format("RBNavLab set {} {} {}", bench_target_pid, ga::kHealthMax,
+                              bench_target_hp));
+        link.exec(fmt::format("RBNavLab set {} {} {}", bench_target_pid, ga::kHealth,
+                              bench_target_hp));
+      }
+      if (!bench_target_spin.empty()) link.exec(bench_target_spin);
+      std::this_thread::sleep_for(1s);
+      tools::logger()->info(
+        "[gestalt] bench target ready map={} pos=({:.2f},{:.2f})m hp={}", tmap,
+        link.attr(tmap, ga::kPosX).value_or(0) / 100.0,
+        link.attr(tmap, ga::kPosY).value_or(0) / 100.0,
+        link.attr(tmap, ga::kHealth).value_or(-1));
+    }
+
     // Bootstrap: face the outpost so plates enter the frame (GT used once,
     // like a driver would park the robot facing the target).
     auto sx = link.attr(sentry, ga::kPosX).value_or(0) / 100.0;
     auto sy = link.attr(sentry, ga::kPosY).value_or(0) / 100.0;
-    boot_bearing_deg = std::atan2(kRedOutpostY - sy, kRedOutpostX - sx) * kRad2Deg;
+    if (bench_vehicle) {
+      // Same GT-used-once convention as the outpost park: the target's spawn
+      // position seeds the boot bearing, then never enters the aim path.
+      const int tmap = link.find_player(bench_target_pid).value_or(-1);
+      const double txm = tmap > 0 ? link.attr(tmap, ga::kPosX).value_or(0) / 100.0 : 0;
+      const double tym = tmap > 0 ? link.attr(tmap, ga::kPosY).value_or(0) / 100.0 : 0;
+      boot_bearing_deg = std::atan2(tym - sy, txm - sx) * kRad2Deg;
+    } else {
+      boot_bearing_deg = std::atan2(kRedOutpostY - sy, kRedOutpostX - sx) * kRad2Deg;
+    }
     bool boot_aligned = false;
     const auto t_align_end = std::chrono::steady_clock::now() + 8s;
     while (std::chrono::steady_clock::now() < t_align_end) {
-      link.exec(fmt::format("UEExec RBExtAim 0 {:.1f} 10 0", boot_bearing_deg));
+      link.exec(
+        fmt::format("UEExec RBExtAim 0 {:.1f} {:.1f} 0", boot_bearing_deg, bench_boot_pitch));
       const auto yaw = link.attr(sentry, ga::kTurretYaw);
       const auto pitch = link.attr(sentry, ga::kTurretPitch);
       if (
         yaw && pitch && std::abs(std::remainder(*yaw - boot_bearing_deg, 360.0)) < 1.5 &&
-        std::abs(*pitch - 10.0) < 1.5) {
+        std::abs(*pitch - bench_boot_pitch) < 1.5) {
         boot_aligned = true;
         break;
       }
@@ -365,6 +510,18 @@ int main(int argc, char ** argv)
     link.exec("UEExec r.VisionBridge.Enable 1");
     link.apply_camera(camera_json);
     std::this_thread::sleep_for(1500ms);
+  }
+
+  // HP probe: the entity whose health decides hits/exit. Vehicle rounds read
+  // the RBNavLab target's map; the classic bench keeps the red outpost.
+  int probe = outpost;
+  if (bench_vehicle) {
+    const auto tmap = link.find_player(bench_target_pid);
+    if (!tmap) {
+      tools::logger()->error("[gestalt] bench target pid={} not in telemetry", bench_target_pid);
+      return 1;
+    }
+    probe = *tmap;
   }
 
   // ---------- capture + the ORIGINAL auto_aim chain ----------
@@ -451,8 +608,13 @@ int main(int argc, char ** argv)
     return ((k % 3) + 3) % 3;
   };
 
-  const double hp0 = outpost > 0 ? link.attr(outpost, ga::kHealth).value_or(1500) : 1500;
-  const double allow0 = link.attr(sentry, ga::kAllowance17mm).value_or(300);
+  const double hp0 = probe > 0 ? link.attr(probe, ga::kHealth).value_or(1500) : 1500;
+  const double allow0 = link.attr(sentry, ga::kAllowance17mm).value_or(bench_allowance);
+  // Baseline for the game's cumulative per-vehicle shot counter (63000002
+  // BulletFiredTotal): "shots" must mean rounds that LEFT THE GUN, not trigger
+  // requests — the loop re-asserts fire across consecutive frames while the
+  // gun is rate/heat-limited, so command counts run absurdly high.
+  const double fired0 = link.attr(sentry, ga::kBulletsFired).value_or(0);
 
   // Async debug window: imshow/waitKey stall 40-80ms on this box — feeding a
   // UI thread through a latest-frame mailbox keeps the vision loop under the
@@ -480,7 +642,11 @@ int main(int argc, char ** argv)
   });
 
   io::Command last_cmd{false, false, 0, 0};
-  int frames = 0, det_frames = 0, cmds = 0, shots = 0, grab_fail = 0;
+  int frames = 0, det_frames = 0, cmds = 0, fire_cmds = 0, grab_fail = 0;
+  // Per-hit damage calibration: histogram of discrete HP drops observed on the
+  // probe (logged at RESULT so bench_damage_per_hit can be verified per target).
+  std::map<int, int> hp_drop_hist;
+  double hp_prev = -1;
   int det_color_hist[4] = {0, 0, 0, 0};  // red/blue/extinguish/purple raw counts
   auto t_ekf_log = std::chrono::steady_clock::now();
 
@@ -545,8 +711,16 @@ int main(int argc, char ** argv)
 
   bool hp_seen = false;
   while (std::chrono::steady_clock::now() < t_end) {
-    const double hp = outpost > 0 ? link.attr(outpost, ga::kHealth).value_or(0) : -1;
+    const double hp = probe > 0 ? link.attr(probe, ga::kHealth).value_or(0) : -1;
     const double allow = link.attr(sentry, ga::kAllowance17mm).value_or(0);
+    // Actual rounds fired so far (BulletFiredTotal delta; allowance drain is
+    // the fallback if the counter attribute is not in this build's telemetry).
+    const auto bf_now = link.attr(sentry, ga::kBulletsFired);
+    const double fired =
+      bf_now ? std::max(0.0, *bf_now - fired0) : std::max(0.0, allow0 - allow);
+    if (hp_prev > 0 && hp > 0 && hp < hp_prev)
+      hp_drop_hist[static_cast<int>(std::lround(hp_prev - hp))]++;
+    if (hp > 0) hp_prev = hp;
     if (hp > 0) hp_seen = true;
     // Only honor hp==0 after a live reading: at boot the attribute may simply
     // not have arrived yet (value_or(0) — the 0.12-sweep instant-exit race).
@@ -1216,7 +1390,7 @@ int main(int argc, char ** argv)
       link.exec(fmt::format(
         "UEExec RBExtAim 0 {:.2f} {:.2f} {}", cmd_yaw_deg, cmd_pitch_deg, fire ? 1 : 0));
       cmds++;
-      if (fire) shots++;
+      if (fire) fire_cmds++;
       last_cmd = command;
     }
 
@@ -1248,8 +1422,8 @@ int main(int argc, char ** argv)
       {10, 90}, {255, 255, 255});
     tools::draw_text(
       img,
-      fmt::format("state:{} det:{}/{} hp:{:.0f} allow:{:.0f} shots:{}",
-                  tracker.state(), det_frames, frames, hp, allow, shots),
+      fmt::format("state:{} det:{}/{} hp:{:.0f} allow:{:.0f} shots:{:.0f}",
+                  tracker.state(), det_frames, frames, hp, allow, fired),
       {10, 120}, {0, 255, 255});
 
     if (!targets.empty()) {
@@ -1291,9 +1465,9 @@ int main(int argc, char ** argv)
       t_log = now;
       auto t_frame_end = std::chrono::steady_clock::now();
       tools::logger()->info(
-        "[gestalt] frames={} det={} cmds={} shots={} hp={:.0f} allow={:.0f} "
+        "[gestalt] frames={} det={} cmds={} fire_cmds={} shots={:.0f} hp={:.0f} allow={:.0f} "
         "det_ms={:.0f} post_ms={:.0f} grab_avg={:.0f} rej_avg={:.0f} rej_n={}",
-        frames, det_frames, cmds, shots, hp, allow,
+        frames, det_frames, cmds, fire_cmds, fired, hp, allow,
         std::chrono::duration<double, std::milli>(t_det1 - t_det0).count(),
         std::chrono::duration<double, std::milli>(t_frame_end - t_det1).count(),
         grab_n ? grab_acc / grab_n : 0, rej_n ? rej_acc / rej_n : 0, rej_n);
@@ -1305,15 +1479,46 @@ int main(int argc, char ** argv)
   ui_quit = true;
   if (ui_thread.joinable()) ui_thread.join();
 
-  const double hp_final = outpost > 0 ? link.attr(outpost, ga::kHealth).value_or(0) : -1;
+  // Let in-flight rounds land before the final HP read (≤6m ⇒ <0.5s fly time).
+  std::this_thread::sleep_for(1500ms);
+  const double hp_final = probe > 0 ? link.attr(probe, ga::kHealth).value_or(0) : -1;
   const double allow_final = link.attr(sentry, ga::kAllowance17mm).value_or(0);
-  const double used = allow0 - allow_final;
-  const double hits = (hp0 - hp_final) / 20.0;
+  const auto bf_final = link.attr(sentry, ga::kBulletsFired);
+  const double used =
+    bf_final ? std::max(0.0, *bf_final - fired0) : std::max(0.0, allow0 - allow_final);
+  const double hits = (hp0 - hp_final) / bench_damage_per_hit;
   link.exec("ExtAimClaim 0 0");
+  if (bench_vehicle) {
+    // Teardown: never kill the target — a corpse keeps extinguished-but-
+    // detectable plates at the test point and poisons the next round's EKF
+    // (observed: w collapsed to 0.02 and 100 rounds hit the corpse for zero
+    // damage). A live car left standing can still body-block later target
+    // drives, so prefer parking it at a configured out-of-the-way spot.
+    if (bench_target_park_cm.size() >= 2) {
+      // Stop the lab's per-tick mode maintenance FIRST — an active mode-99
+      // spin re-asserts itself every tick and overrides the park goto
+      // (observed: the hero never left the test point).
+      link.exec(fmt::format("RBNavLab mode {} 0 0", bench_target_pid));
+      link.exec(fmt::format("RBNavLab goto {} {} {}", bench_target_pid,
+                            static_cast<int>(bench_target_park_cm[0]),
+                            static_cast<int>(bench_target_park_cm[1])));
+    } else {
+      link.exec(fmt::format("RBNavLab mode {} 0 0", bench_target_pid));
+      link.exec(fmt::format("RBNavLab clear {}", bench_target_pid));
+    }
+  }
+  if (!hp_drop_hist.empty()) {
+    std::string drops;
+    for (const auto & [delta, n] : hp_drop_hist) drops += fmt::format("{}x-{} ", n, delta);
+    tools::logger()->info(
+      "[gestalt] hp drop histogram (calibrates bench_damage_per_hit={}): {}",
+      bench_damage_per_hit, drops);
+  }
   tools::logger()->info(
     "[gestalt] RESULT={} hp {}->{} damaging_hits={} bullets={} hit_rate={:.3f} "
-    "frames={} det_rate={:.3f}",
+    "frames={} det_rate={:.3f} fire_cmds={} dmg_per_hit={}",
     hp_final == 0 ? "DESTROYED" : "PARTIAL", hp0, hp_final, hits, used,
-    used > 0 ? hits / used : 0.0, frames, frames > 0 ? 1.0 * det_frames / frames : 0.0);
+    used > 0 ? hits / used : 0.0, frames, frames > 0 ? 1.0 * det_frames / frames : 0.0,
+    fire_cmds, bench_damage_per_hit);
   return hp_final == 0 ? 0 : 2;
 }

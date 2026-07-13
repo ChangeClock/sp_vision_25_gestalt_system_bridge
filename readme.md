@@ -29,11 +29,44 @@
 - `configs/gestalt_far.yaml`：红方前哨，1280x720、FOV 25°、FXAA、中心 640x640 ROI。
 - `configs/gestalt_far_blue.yaml`：蓝方车辆靶；仅仿真配置启用英雄 `one/small -> one/big` 修正。
 - `configs/gestalt_observe.yaml` 与 `gestalt_{d45,d65,d85,f12,f16,f20,f24}.yaml`：相机/距离控制变量扫描。
+- `configs/gestalt_sentry_{outpost,fortress_infantry,base_hero}.yaml`：哨兵三靶验收 bench（见下节）。
 
 调试窗颜色：青色为本帧检测，绿色为 EKF 当前时刻的全部装甲板模型，红色为计入系统延迟和弹道后的未来命中板位。旋转目标上只应比较青框和最近的一只绿框；红框本来就不应与当前装甲重合。
 
 公平性边界：前哨转速幅值按规则书视为已知，旋转方向每局随机并必须由视觉时序估计。游戏内转速属性或底盘遥测只能用于离线验收，禁止进入估计或控制链。
 
+### 哨兵三靶验收 bench（example）
+
+`src/gestalt.cpp` 支持 `bench_*` 配置族，把整局测试编排（shooter 生成/开点、靶车生成/导航/小陀螺/血量抬高、命中判读）收进 yaml。三个标准场景（蓝方哨兵 66000012 停前哨吊射点，各 100 发预算）：
+
+```powershell
+# ① 游戏侧（gestalt_system 仓库）：prep 阶段 + 保活
+powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSeconds 5400 -MapId 4 -ResX 1280 -ResY 720
+# 端口读 Saved\ai-selftest\<log>.wsport；轮① 前哨轮建议先抬 HP 保证 100 发打满：
+#   scripts/rb-console-exec.ps1 -Command 'BatchSet 10000003 100000 red outpost' -LogPath <log>
+
+# ② 视觉侧：依赖 DLL 需在 PATH（opencv vc16/bin + openvino libs）
+.\build\Release\gestalt.exe <ws-port> configs\gestalt_sentry_outpost.yaml           --timeout=300
+.\build\Release\gestalt.exe <ws-port> configs\gestalt_sentry_fortress_infantry.yaml --timeout=300
+.\build\Release\gestalt.exe <ws-port> configs\gestalt_sentry_base_hero.yaml         --timeout=300
+```
+
+2026-07-13 实测基线（100 发/轮，`RESULT` 末行）：
+
+| 轮 | 靶 | 状态 | hit_rate | det_rate |
+|---|---|---|---|---|
+| ① | 红前哨 @5.9m | 自转 ±144°/s | **0.570** | 0.923 |
+| ② | 红步兵 @蓝堡垒 6.5m | mode99 小陀螺 ω≈-4.2rad/s | **0.420** | 0.991 |
+| ③ | 红英雄 @基地吊射点(DeploymentBlue) 5.5m | 准静态（英雄底盘无 fSpinSpeed，mode99 不生效） | **0.570** | 1.000 |
+
+关键语义与坑（均已在 bench 编排里内置处置）：
+
+- `shots`（调试窗/RESULT `bullets=`）读游戏遥测 `BulletFiredTotal(63000002)` 差值 = 实际出膛数；发射命令数另记 `fire_cmds`（约为实际 17-20 倍，勿混淆）。
+- 单发伤害标定看 RESULT 前的 `hp drop histogram`：前哨 20 HP/发，车辆装甲 24 HP/发（`bench_damage_per_hit`）。
+- 车辆靶血量：先抬 `HealthMax(60000004)` 再抬 `Health(10000003)`，否则被钳回默认值。
+- 靶车必须在**哨兵视野内的半场**：蓝方哨兵在前哨吊射点的可视点位 = 红前哨、蓝堡垒 `(0.03,7.72)m`、DeploymentBlue `(-5.20,8.50)m`；红方堡垒 `(0.1,-7.2)m` 被遮挡（实测 det 0.005）。
+- 尸体陷阱：不要在测试点击杀靶车——灭灯板仍可被检出，会污染下一轮 EKF（实测 w 塌缩到 0、100 发全打尸体零伤害）。teardown 只 release 不击杀。
+- 英雄靶两个专属项：yolo 必须开 `sim_one_as_big: true`（否则 check_type 在检测层抹掉全部英雄板，det=0）；到达判定用 `bench_target_goal_radius_cm: 350`（英雄级底盘 AutoPath 停靠带 ~3m）。英雄长途导航可能中途搁浅（z 陷地、任意 goto 不响应），换车分段路点（东走廊 `(500,800)→(-100,900)→(-520,850)`）可绕开。
 
 ## 1 功能介绍
 自瞄的定义和意义。我们对自瞄的定义为“针对移动装甲板目标的自动瞄准和自动火控软件”。当操作手切换成自瞄模式后，自瞄会接管云台的控制权，通过对敌方运动轨迹的预测和弹道解算，控制云台进行追踪；同时，自瞄还会接管发射机构的控制权，判断开火时机。自瞄的意义在于提高我方作战能力，实现短击杀时间、高命中率的作战效果。 

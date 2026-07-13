@@ -1,0 +1,82 @@
+# Round 2 of the sentry acceptance bench: BLUE SENTRY at the outpost-lob point
+# vs a SPINNING RED INFANTRY target parked at the BLUE fortress — the opposing
+# half, i.e. where a red attacker actually stands in a match and the only
+# fortress inside the sentry perch's viewshed (the red fortress at (0.1,-7.2)m
+# is occluded — verified det_rate 0.005). GMapInfo fFortressBlue=(0.03,7.72)m.
+# Target: RBNavLab spawn → goto → HealthMax+HP boost → mode99 spin. 100 rounds.
+#
+#   build\Release\gestalt.exe <ws-port> configs\gestalt_sentry_fortress_infantry.yaml
+
+enemy_color: "red"
+
+#####----- bench scenario -----#####
+bench_shooter_entity: "66000012"
+bench_shooter_class: 1004
+bench_allowance: 100
+bench_target: "vehicle"
+bench_target_pid: 92011
+bench_target_spawn: "RBNavLab spawn entity=infantry team=0 tn=3 pid=92011"
+bench_target_drive: "RBNavLab goto 92011 3 772"  # blue fortress (0.03,7.72)m → cm
+bench_target_goal_cm: [3, 772]
+bench_target_spin:  "RBNavLab mode 92011 99 0"   # isolated vision-bench spin primitive
+bench_target_park_cm: [500, -100]                # teardown: drive clear of later rounds
+bench_target_hp: 5000                            # 100 rounds can't kill it mid-bench
+bench_damage_per_hit: 24                         # calibrated: hp-drop histogram 42x-24 (2026-07-13)
+bench_boot_pitch: 0                              # ground vehicle, flat boot pose
+
+#####----- detector / yolo -----#####
+yolo_name: yolo11
+yolo11_model_path: assets/yolo11.xml
+classify_model: assets/tiny_resnet.onnx
+device: CPU
+min_confidence: 0.4
+roi: { x: 320, y: 26, width: 640, height: 640 }
+use_roi: true
+
+# traditional-detector keys — required by construction, inert on the yolo path:
+threshold: 150
+max_angle_error: 45
+min_lightbar_ratio: 1.5
+max_lightbar_ratio: 20
+min_lightbar_length: 8
+min_armor_ratio: 1
+max_armor_ratio: 5
+max_side_ratio: 1.5
+max_rectangular_error: 25
+
+#####----- tracker -----#####
+min_detect_count: 3
+max_temp_lost_count: 15
+outpost_max_temp_lost_count: 75
+max_frame_gap: 0.20
+
+#####----- aimer -----#####
+yaw_offset: 0
+pitch_offset: 0
+comming_angle: 60
+leaving_angle: 20
+decision_speed: 8
+high_speed_delay_time: 0.20
+low_speed_delay_time: 0.20
+
+#####----- shooter -----#####
+first_tolerance: 3
+second_tolerance: 2
+judge_distance: 2
+auto_fire: true
+
+#####----- geometry (OpenCV cam → UE world) -----#####
+R_gimbal2imubody: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+R_camera2gimbal:  [0, 0, 1, -1, 0, 0, 0, -1, 0]
+t_camera2gimbal:  [0, 0, 0]
+
+#####----- camera intrinsics (ideal UE pinhole, FOV_h=25 @ 1280x720) -----#####
+camera_matrix: [2886.9, 0, 640.0, 0, 2886.9, 360.0, 0, 0, 1]
+distort_coeffs: [0, 0, 0, 0, 0]
+sim_quad_scale: 1.192
+# Spinning-vehicle adapters: v_adapter is the small-gyro fix (synthesized
+# inward normals); z_adapter stays OFF — its 3-slot phase bucket is
+# outpost-drum-specific and mis-bins a 4-plate car.
+z_adapter: false
+v_adapter: true
+camera_json: '{"enabled":1,"fovDegrees":25,"shutterSpeed":120,"iso":600}'
