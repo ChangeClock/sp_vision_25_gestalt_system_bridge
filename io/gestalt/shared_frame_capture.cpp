@@ -221,9 +221,11 @@ SharedFrameCapture::~SharedFrameCapture()
   delete impl_;
 }
 
-bool SharedFrameCapture::init(int ws_port, int timeout_ms)
+bool SharedFrameCapture::init(
+  int ws_port, int timeout_ms, const std::function<bool()> & interrupted)
 {
   impl_->close();
+  if (interrupted && interrupted()) return false;
   const DWORD listener_pid = listener_pid_for_port(ws_port);
   if (!listener_pid) {
     std::fprintf(
@@ -245,9 +247,17 @@ bool SharedFrameCapture::init(int ws_port, int timeout_ms)
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   const auto name = mapping_name(found.pid);
   while (std::chrono::steady_clock::now() < deadline) {
+    if (interrupted && interrupted()) {
+      impl_->close();
+      return false;
+    }
     impl_->mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
     if (impl_->mapping) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  if (interrupted && interrupted()) {
+    impl_->close();
+    return false;
   }
   if (!impl_->mapping) {
     std::fprintf(

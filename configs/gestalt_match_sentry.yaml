@@ -1,11 +1,20 @@
 # LIVE-MATCH sentry takeover: sp_vision spawns a RED SENTRY in the prep stage,
 # claims its turret + fire, arms the camera/bridge, and only then STARTS the
 # match — externally owned from second zero. Chassis navigation and economy
-# stay with the built-in AI. Launch the game held in prep (-SkipMatchStart):
+# stay with the built-in AI. Use a verified immutable CI package drop, never a
+# local UE build. Terminal A keeps the game held in prep (-SkipMatchStart);
+# terminal B starts gestalt only after the .wsport appears:
 #
-#   powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 `
-#       -MatchObserveSeconds 900 -MapId 4 -ResX 1280 -ResY 720
+#   # Terminal A, from the gestalt_system repo (keep this command blocking):
+#   powershell -File scripts/ai-match-selftest.ps1 `
+#       -PackagedExe Build\Win64\Gestalt_System.exe -SkipMatchStart 1 `
+#       -MatchObserveSeconds 900 -MapId 4 -ResX 1280 -ResY 720 `
+#       -WsBind 127.0.0.1 -ExtraArgs '-externalvisioncontrol -visionbridge'
+#   # Terminal B, from this repo, using A's exact printed <run-log>.wsport:
 #   .\build\Release\gestalt.exe <ws-port> configs\gestalt_match_sentry.yaml --timeout=600
+#
+# See docs/ai-cookbook-command-guide.md for CI drop verification and the full
+# two-terminal command sequence.
 #
 # The bridge constructs/compiles and infer-warms the detector + solver before
 # touching match state, then claims pid 0 via ExtAimClaim (atomic old-mode save + mode90).
@@ -22,9 +31,14 @@
 # own business. The bridge only shows live revive progress and re-asserts claim
 # + gun view after HP returns on the same map (in-place revive) or a newer map,
 # then repeats identity + physical-ready + mode/frame/FOV/armLength/RBExtAim
-# effect gates. WS or
-# capture recovery likewise requires claim + takeover + camera + the full gate;
-# otherwise the run fails safely. Pixel capture is pinned to the process that
+# effect gates. Both revive discovery and post-revive physical readiness consume
+# the remaining --timeout budget rather than an independent short cutoff. Pre-match
+# fixes one WS generation before Respawn; re-arm fixes one after connect and before
+# claim. Spawn/claim/commands/camera/effect proof must all stay on it. A reconnect
+# while waiting dead is allowed, but the revived pawn must then pass a fresh full
+# gate on the new generation. Natural settlement stops heartbeat/probe commands and
+# is returned separately from gate failure. WS/capture recovery likewise requires
+# the full gate; otherwise the run fails safely. Pixel capture is pinned to the process that
 # owns the requested WS listener port, so another UE publisher cannot be mixed
 # into this control session. Exit on match end / timeout.
 

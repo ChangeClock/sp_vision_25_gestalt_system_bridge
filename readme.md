@@ -73,7 +73,7 @@ powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSe
 
 ### 实战整局接管（gestalt_match_sentry.yaml）
 
-`bench_match: true` 走"赛前接管"编排：先完成 OpenVINO 模型编译、黑帧 infer warmup 与 solver/tracker/aimer/shooter 构造，再在 prep 阶段手动生成 HACHISEN 哨兵（`66000005`，SKM_Sentry 底盘）并以 `PlayerID=0 + TeamID=0 + Class=1004 + ConnectionEntityConfigId=66000005` 四重验证 → ExtAimClaim（由游戏原子保存旧 TargetMode 并切到 mode90）+RBTakeOver 认领 → 布相机/帧桥 → 连续新帧/分辨率/FOV/armLength/TargetMode/RBExtAim 小角度响应全部效果门通过 → 自己发 `SetMatchStatus 1` 开赛——**比赛第 0 秒即外控**，任一赛前门失败绝不开赛。claim 由独立线程每秒续租，不受模型推理或 15s 采集等待阻塞；阵亡等待前主动停续租并显式 release，复活后才重新 claim。游戏侧 5s claim lease 与 0.75s fire watchdog 仍会在进程崩溃/断连后自动恢复内置瞄准并释放锁存扳机。底盘导航与补给经济全留给内置 AI；阵亡后复活交给游戏逻辑，桥只接受 HP 已从 0 回正、map id 与尸体相同（原地复活）或更高（重建 pawn）且身份仍正确的存活对象，并按 claim→view→camera 顺序重挂；先等待 Defeated/CanOperate/IsChassisOnline/Weakened 与炮口物理姿态恢复，再以严格双轴到达+回位（瞬态失败可稳定后反向重试一次）证明外控效果，仍不能证明就硬失败。死亡等待使用整场 `--timeout` 总截止时间，不再被更短的局部上限截断。WS 或帧采集恢复也必须重新 claim/takeover/apply camera 并通过完整门，否则安全失败。共享帧严格绑定请求 WS 端口的监听进程 PID，避免多游戏 publisher 串流。丢锁 >2s 时云台巡扫：yaw 60°/s 整圈旋转 + pitch ±15° 三角波（周期非整数比→螺旋覆盖不同仰角带，纯水平扫会漏枪线下方近距目标）。扫描按真实 `steady_clock` 时间推进且限制卡帧步长；pitch 带外会平滑回带；tracker 前的 `armors_ui` 原始检测一出现就用当前遥测 yaw/pitch 冻结两轴，而不是继续命令旧扫描目标。
+`bench_match: true` 走"赛前接管"编排：先完成 OpenVINO 模型编译、黑帧 infer warmup 与 solver/tracker/aimer/shooter 构造，再在 prep 阶段手动生成 HACHISEN 哨兵（`66000005`，SKM_Sentry 底盘）并以 `PlayerID=0 + TeamID=0 + Class=1004 + ConnectionEntityConfigId=66000005` 四重验证 → ExtAimClaim（由游戏原子保存旧 TargetMode 并切到 mode90）+RBTakeOver 认领 → 布相机/帧桥 → 连续新帧/分辨率/FOV/armLength/TargetMode/RBExtAim 小角度响应全部效果门通过 → 自己发 `SetMatchStatus 1` 开赛——**比赛第 0 秒即外控**，任一赛前门失败绝不开赛。claim 由独立线程每秒续租，不受模型推理或 15s 采集等待阻塞；阵亡等待前主动停续租并显式 release，复活后才重新 claim。游戏侧 5s claim lease 与 0.75s fire watchdog 仍会在进程崩溃/断连后自动恢复内置瞄准并释放锁存扳机。底盘导航与补给经济全留给内置 AI；阵亡后复活交给游戏逻辑，桥只接受 HP 已从 0 回正、map id 与尸体相同（原地复活）或更高（重建 pawn）且身份仍正确的存活对象，并按 claim→view→camera 顺序重挂；先等待 Defeated/CanOperate/IsChassisOnline/Weakened 与炮口物理姿态恢复，再以严格双轴到达+回位（瞬态失败可稳定后反向重试一次）证明外控效果，仍不能证明就硬失败。死亡等待与复活后的物理就绪等待均使用整场 `--timeout` 总截止时间，不再被 180s/30s 局部上限截断；`--timeout` 仅接受 `(0,86400]` 的有限秒数。pre-match 在首条 Respawn 前、rearm 在 connected 后首条 claim 前固定 WS generation；spawn/claim/takeover/cvar/frame/camera/readiness/双轴响应/回位及最终成功全部持续核对同一 generation，断开或重连即中止，绝不跨代拼证。死亡等待本身允许 GameLink 重连，但复活后必须在新 generation 上通过完整门。已开赛 gate 观察到自然结算会立即停 heartbeat 与后续探测命令，并作为 match-ended 锁存而非 takeover failure。WS 或帧采集恢复也必须重新 claim/takeover/apply camera 并通过完整门，否则安全失败。共享帧严格绑定请求 WS 端口的监听进程 PID，避免多游戏 publisher 串流。丢锁 >2s 时云台巡扫：yaw 60°/s 整圈旋转 + pitch ±15° 三角波（周期非整数比→螺旋覆盖不同仰角带，纯水平扫会漏枪线下方近距目标）。扫描按真实 `steady_clock` 时间推进且限制卡帧步长；pitch 带外会平滑回带；tracker 前的 `armors_ui` 原始检测一出现就用当前遥测 yaw/pitch 冻结两轴，而不是继续命令旧扫描目标。
 
 ```powershell
 powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSeconds 900 -MapId 4 -ResX 1280 -ResY 720
@@ -134,30 +134,48 @@ powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSe
 ### 完整复现流程（从零到整局接管）
 
 ```powershell
-# 0) 构建两侧（一次性）
-#    游戏侧（gestalt_system 仓库根）：
-powershell -File scripts/ue-build.ps1          # C++（需含 applySettings armLength 键）
-npx vite build --mode development              # TS bundle
-#    视觉侧（本仓库根，VS2022 x64；依赖路径见上文 Windows 构建说明）：
-cmake --build build --config Release --target gestalt
+# 0) 游戏只取 Preview/Shipping tag CI 发布的不可变 NAS drop；不要本地编译 UE，
+#    也不要用遗留 Build/Win64 代替该 tag。先核对 PUBLISHED.ok、manifest.json、
+#    tag/commit/buildConfig 与 launcher/game exe SHA256，再在 gestalt_system 主仓执行：
+$gameRepo = 'C:\path\to\gestalt_system'
+$spRepo = 'C:\path\to\sp_vision_25_gestalt_system_bridge'
+powershell -File "$gameRepo\scripts\fetch-package-drop.ps1" -DropId <完整-tag>
 
-# 1) gestalt.exe 运行依赖 DLL 上 PATH（缺了报 0xC0000135）
+# 视觉侧可在本仓库本地构建（VS2022 x64；依赖路径见上文 Windows 构建说明）：
+cmake --build "$spRepo\build" --config Release --target gestalt
+
+```
+
+**终端 A（游戏，必须保持阻塞）**：
+
+```powershell
+powershell -File "$gameRepo\scripts\ai-match-selftest.ps1" `
+  -PackagedExe "$gameRepo\Build\Win64\Gestalt_System.exe" `
+  -SkipMatchStart 1 -MatchObserveSeconds 1200 -MapId 4 -ResX 1280 -ResY 720 `
+  -WsBind 127.0.0.1 -ExtraArgs '-externalvisioncontrol -visionbridge'
+```
+
+终端 A 不会在 `.wsport` 出现时退出；保持它承载游戏，同时另开 **终端 B（视觉）**：
+
+```powershell
+$gameRepo = 'C:\path\to\gestalt_system'
+$spRepo = 'C:\path\to\sp_vision_25_gestalt_system_bridge'
+# gestalt.exe 运行依赖 DLL 必须在这个新终端的 PATH 上（缺了报 0xC0000135）
 $env:PATH = "<deps>\opencv\build\x64\vc16\bin;<python>\Lib\site-packages\openvino\libs;" + $env:PATH
+# 终端 A 会打印本次唯一的 `log:` 绝对路径；不要按“最新文件”猜测并发 run。
+$runLog = '<终端 A 打印的 ...\Build\Win64\Saved\ai-selftest\ai_selftest_<run>.log>'
+$port = Get-Content "$runLog.wsport"
 
-# 2) 启动游戏（prep 阶段保活 20 分钟）
-powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSeconds 1200 -MapId 4 -ResX 1280 -ResY 720
-$port = Get-Content "Saved\ai-selftest\<最新log>.wsport"
+# 2a) 三靶验收 bench（可选；前哨轮先抬 HP 保证 100 发打满）
+powershell -File "$gameRepo\scripts\rb-console-exec.ps1" -Command 'BatchSet 10000003 100000 red outpost' -LogPath <log绝对路径>
+& "$spRepo\build\Release\gestalt.exe" $port "$spRepo\configs\gestalt_sentry_outpost.yaml"            --timeout=300
+& "$spRepo\build\Release\gestalt.exe" $port "$spRepo\configs\gestalt_sentry_fortress_infantry.yaml" --timeout=300
+& "$spRepo\build\Release\gestalt.exe" $port "$spRepo\configs\gestalt_sentry_base_hero.yaml"          --timeout=300
 
-# 3a) 三靶验收 bench（可选；前哨轮先抬 HP 保证 100 发打满）
-powershell -File scripts/rb-console-exec.ps1 -Command 'BatchSet 10000003 100000 red outpost' -LogPath <log绝对路径>
-.\build\Release\gestalt.exe $port configs\gestalt_sentry_outpost.yaml           --timeout=300
-.\build\Release\gestalt.exe $port configs\gestalt_sentry_fortress_infantry.yaml --timeout=300
-.\build\Release\gestalt.exe $port configs\gestalt_sentry_base_hero.yaml         --timeout=300
+# 2b) 实战整局接管（桥自己完成：生成哨兵→认领→布相机→开赛→打完整局）
+& "$spRepo\build\Release\gestalt.exe" $port "$spRepo\configs\gestalt_match_sentry.yaml" --timeout=600
 
-# 3b) 实战整局接管（桥自己完成：生成哨兵→认领→布相机→开赛→打完整局）
-.\build\Release\gestalt.exe $port configs\gestalt_match_sentry.yaml --timeout=600
-
-# 4) 判读：日志末行 RESULT=...
+# 3) 判读：日志末行 RESULT=...
 #    bench 轮看 hit_rate/det_rate（hp drop histogram 标定单发伤害：前哨20/车辆24）
 #    match 轮看 damage_dealt / lives_lost / bullets（hp 口径=自身存活，hit_rate 无意义）
 ```

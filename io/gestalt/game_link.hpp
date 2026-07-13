@@ -68,10 +68,16 @@ public:
 
   // Console command through the game's TS console (fire-and-forget).
   void exec(const std::string & command);
+  // Sends only when the socket is still the exact connection generation the
+  // caller fixed. The identity check and WebSocket send share ws_mu_, so a
+  // reconnect cannot redirect a lease renewal or gate command to a new socket.
+  bool exec_if_generation(const std::string & command, uint64_t expected_generation);
 
   // rgbCamera.applySettings with a raw JSON camera object, e.g.
   // R"({"enabled":1,"fovDegrees":45,"shutterSpeed":120})".
   void apply_camera(const std::string & camera_json);
+  bool apply_camera_if_generation(
+    const std::string & camera_json, uint64_t expected_generation);
 
   // Pose history for one designated vehicle map: every turret yaw/pitch push
   // is timestamped on arrival so callers can interpolate the pose TO THE FRAME
@@ -107,6 +113,7 @@ private:
   void reader_loop();
   void watch(const std::vector<int> & ids);
   void send_raw(const std::string & payload);
+  bool send_raw_if_generation(const std::string & payload, uint64_t expected_generation);
   bool connect_once();
 
   struct PoseSample

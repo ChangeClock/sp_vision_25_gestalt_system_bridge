@@ -7,6 +7,7 @@
 #include "win_capture.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace io::gestalt
@@ -23,7 +24,11 @@ public:
   // Resolves the process listening on the loopback WebSocket port, finds that
   // exact process' game window, and opens only its process-scoped mapping.
   // This prevents a second UE publisher from stealing the pixel data plane.
-  bool init(int ws_port, int timeout_ms = 10000);
+  // An optional interruption callback makes the mapping wait cancellable for
+  // match settlement or WebSocket-generation loss.
+  bool init(
+    int ws_port, int timeout_ms = 10000,
+    const std::function<bool()> & interrupted = {});
   CapturedFrame grab(int timeout_ms = 100);
   void raise_window();
 

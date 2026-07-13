@@ -121,10 +121,13 @@ $env:PATH = '<opencv-vc16-bin>;<openvino-libs>;' + $env:PATH
 .\build\Release\gestalt.exe $port configs\gestalt_match_sentry.yaml --timeout=600
 ```
 
+`--timeout` 必须是有限秒数且位于 `(0, 86400]`；它是整场唯一的 engagement deadline。
+
 `gestalt_match_sentry.yaml` 的顺序是：
 
 1. 在发送任何 `SetMatchStatus` 前完成 OpenVINO 模型编译、一次黑帧 infer warmup 和
-   solver/tracker/aimer/shooter 构造；失败就停在 prep。
+   solver/tracker/aimer/shooter 构造；失败就停在 prep。确认 WS connected 后，在第一条
+   `Respawn` 前固定 pre-match generation；rearm 则在 connected 后、第一条 claim 前固定。
 2. `Respawn 0 66000005 0`，等待 pid 0 对应的新 combat map 且 HP>0，并同时验证
    `PlayerID=0`、`TeamID=0`、`Class=1004` 与玩家表
    `ConnectionEntityConfigId=66000005`。
@@ -146,10 +149,22 @@ $env:PATH = '<opencv-vc16-bin>;<openvino-libs>;' + $env:PATH
 7. 每次复活只接受 HP 已经从 0 回到正值、map id 等于尸体 map（原地复活）或严格更高
    （重建 pawn）且四重身份仍正确的存活 pawn，再按 **claim → takeover → apply camera**
    重挂；重复 mode90、连续帧、FOV/armLength、物理就绪和小角度响应效果门后才恢复控制循环。
-   死亡等待沿用整场 `--timeout` 的总截止时间，不另设更短的 180 秒截断。
+   死亡等待与复活后的物理就绪等待均沿用整场 `--timeout` 的总截止时间，不另设 180 秒或
+   30 秒的局部截断；全部物理谓词仍必须真实满足。从 Respawn/claim 起到 takeover、cvar、
+   frame、camera、readiness、双轴响应/回位及最终成功均须保持调用方固定的同一 generation；
+   WS 断开或 generation 改变会立即安全中止，绝不拼接断线前后的证据。claim heartbeat
+   自身也绑定该 generation；其续租发送在 GameLink 的 socket 锁内原子核对连接代际，代变即
+   自停，绝不会把旧 lease 续到新 socket。pre-match/rearm 只有在最终成功前后再次核对连接与
+   heartbeat 绑定后才输出 verified generation，控制循环只采纳这个输出，不重新读取后静默接受；
+   后续每条瞄准、巡扫、清火与 observe 指令也在 socket 锁内绑定该 generation，拒绝发送就暂停
+   lease 并强制下一轮完整 rearm，不能在 frame grab/infer 窗口跨代漏发。
 8. WS/采集一旦中断，恢复后必须重新执行 **claim → takeover → apply camera** 与
    mode90、frame/FOV/armLength、RBExtAim 响应全门；不能证明就安全失败。WS 与像素流
-   必须属于同一监听/writer PID。
+   必须属于同一监听/writer PID。死亡等待本身允许 GameLink 重连，但发现复活对象后必须在
+   新 generation 上从头完成上述重挂与效果门，不能沿用断线前已通过的任何阶段。
+   已开赛 gate 的任一阶段（包括 frame stream init、view blend、frame grab）观察到
+   `MatchStatus>=2` 时，立即停 heartbeat 与后续探测命令，以独立 `match-ended` 结果交给
+   控制循环锁存自然结算，不把它误记为 takeover failure。
 9. 对局结算先用 fire=0 清掉锁存扳机，再 `ExtAimClaim 0 0` 和
    `UEExec RBTakeOver release`；等待 AttributeMap 证明 TargetMode 已不为 90（恢复
    claim 保存的旧值）。

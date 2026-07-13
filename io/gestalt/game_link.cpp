@@ -191,6 +191,30 @@ void GameLink::exec(const std::string & command)
   send_raw(msg.dump());
 }
 
+bool GameLink::send_raw_if_generation(
+  const std::string & payload, uint64_t expected_generation)
+{
+  std::lock_guard<std::mutex> lk(ws_mu_);
+  auto * ws = static_cast<WebSocket *>(ws_);
+  if (
+    !connected_.load(std::memory_order_acquire) ||
+    connection_generation_.load(std::memory_order_acquire) != expected_generation || !ws ||
+    ws->getReadyState() != WebSocket::OPEN)
+    return false;
+  ws->send(payload);
+  return true;
+}
+
+bool GameLink::exec_if_generation(
+  const std::string & command, uint64_t expected_generation)
+{
+  json msg = {{"type", 0},
+              {"id", next_id_.fetch_add(1, std::memory_order_relaxed) + 1},
+              {"method", "console.exec"},
+              {"params", {{"command", command}}}};
+  return send_raw_if_generation(msg.dump(), expected_generation);
+}
+
 void GameLink::apply_camera(const std::string & camera_json)
 {
   json cam = json::parse(camera_json, nullptr, false);
@@ -200,6 +224,18 @@ void GameLink::apply_camera(const std::string & camera_json)
               {"method", "rgbCamera.applySettings"},
               {"params", {{"camera", cam}}}};
   send_raw(msg.dump());
+}
+
+bool GameLink::apply_camera_if_generation(
+  const std::string & camera_json, uint64_t expected_generation)
+{
+  json cam = json::parse(camera_json, nullptr, false);
+  if (cam.is_discarded()) return false;
+  json msg = {{"type", 0},
+              {"id", next_id_.fetch_add(1, std::memory_order_relaxed) + 1},
+              {"method", "rgbCamera.applySettings"},
+              {"params", {{"camera", cam}}}};
+  return send_raw_if_generation(msg.dump(), expected_generation);
 }
 
 std::optional<double> GameLink::attr(int map_id, int attr_id) const

@@ -17,6 +17,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -50,9 +51,23 @@ constexpr double kRad2Deg = 180.0 / CV_PI;
 // enters the aim path (same convention as tools/outpost_benchmark.py).
 constexpr double kRedOutpostX = -3.81, kRedOutpostY = -2.83;
 constexpr double kStandoffXcm = 13.0, kStandoffYcm = -306.0;
+constexpr double kMaxEngagementTimeoutSeconds = 24.0 * 60.0 * 60.0;
 constexpr int kRedTeamId = 0;
 constexpr int kSentryClassId = 1004;
 constexpr int kHachisenEntityConfigId = 66000005;
+
+enum class TakeoverGateResult
+{
+  kPassed,
+  kFailed,
+  kMatchEnded,
+};
+
+struct GenerationBoundGateResult
+{
+  TakeoverGateResult result = TakeoverGateResult::kFailed;
+  uint64_t ws_generation = 0;
+};
 
 std::chrono::steady_clock::time_point qpc_to_steady(double t_seconds)
 {
@@ -96,22 +111,40 @@ public:
     if (worker_.joinable()) worker_.join();
   }
 
-  void activate(int player_id)
+  bool activate(int player_id, uint64_t expected_generation)
   {
     std::lock_guard<std::mutex> lock(mu_);
+    active_ = false;
     player_id_ = player_id;
-    active_ = true;
+    expected_generation_ = expected_generation;
     // The initial claim is synchronous: callers may immediately issue
     // RBTakeOver/camera commands knowing mode preservation has been requested.
-    link_.exec(fmt::format("ExtAimClaim {} 1", player_id_));
+    if (!link_.exec_if_generation(
+          fmt::format("ExtAimClaim {} 1", player_id_), expected_generation_)) {
+      tools::logger()->error(
+        "[gestalt] claim heartbeat refused initial claim: pid={} expected_generation={} "
+        "observed_generation={} connected={}",
+        player_id_, expected_generation_, link_.connection_generation(), link_.connected());
+      return false;
+    }
+    active_ = true;
     wake_.notify_all();
+    return true;
   }
 
   void pause()
   {
     std::lock_guard<std::mutex> lock(mu_);
     active_ = false;
+    expected_generation_ = 0;
     wake_.notify_all();
+  }
+
+  bool active_for(int player_id, uint64_t expected_generation)
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    return active_ && player_id_ == player_id && expected_generation_ == expected_generation &&
+           link_.connected() && link_.connection_generation() == expected_generation;
   }
 
 private:
@@ -122,11 +155,43 @@ private:
       wake_.wait(lock, [&] { return stop_ || active_; });
       if (stop_) break;
       const int scheduled_player = player_id_;
-      const bool interrupted = wake_.wait_for(lock, 1s, [&] {
-        return stop_ || !active_ || player_id_ != scheduled_player;
-      });
-      if (interrupted) continue;
-      link_.exec(fmt::format("ExtAimClaim {} 1", scheduled_player));
+      const uint64_t scheduled_generation = expected_generation_;
+      auto next_renewal = std::chrono::steady_clock::now() + 1s;
+      while (
+        !stop_ && active_ && player_id_ == scheduled_player &&
+        expected_generation_ == scheduled_generation) {
+        const auto poll_deadline = std::min(
+          next_renewal, std::chrono::steady_clock::now() + 100ms);
+        wake_.wait_until(lock, poll_deadline, [&] {
+          return stop_ || !active_ || player_id_ != scheduled_player ||
+                 expected_generation_ != scheduled_generation;
+        });
+        if (
+          stop_ || !active_ || player_id_ != scheduled_player ||
+          expected_generation_ != scheduled_generation)
+          break;
+        if (
+          !link_.connected() ||
+          link_.connection_generation() != scheduled_generation) {
+          active_ = false;
+          expected_generation_ = 0;
+        } else if (std::chrono::steady_clock::now() >= next_renewal) {
+          if (!link_.exec_if_generation(
+                fmt::format("ExtAimClaim {} 1", scheduled_player), scheduled_generation)) {
+            active_ = false;
+            expected_generation_ = 0;
+          } else {
+            next_renewal = std::chrono::steady_clock::now() + 1s;
+          }
+        }
+        if (!active_) {
+          tools::logger()->warn(
+            "[gestalt] claim heartbeat self-stopped: pid={} expected_generation={} "
+            "observed_generation={} connected={}",
+            scheduled_player, scheduled_generation, link_.connection_generation(),
+            link_.connected());
+        }
+      }
     }
   }
 
@@ -136,6 +201,7 @@ private:
   bool active_ = false;
   bool stop_ = false;
   int player_id_ = -1;
+  uint64_t expected_generation_ = 0;
   std::thread worker_;
 };
 
@@ -221,7 +287,7 @@ int main(int argc, char ** argv)
     "{record       | 1                   | per-frame est-vs-gt jsonl to gestalt_record.jsonl}"
     "{setup        | 1                   | run prep-stage spawn/drive/claim sequence}"
     "{fire         | 1                   | allow trigger pulls}"
-    "{timeout      | 800                 | engagement wall-clock budget, s}"
+    "{timeout      | 800                 | engagement wall-clock budget, s (0, 86400]}"
     "{dumpui       | 0                   | write every Nth annotated debug frame to ui_dump/ (0 = off)}");
   const int port = cli.get<int>("@ws-port");
   const std::string config = cli.get<std::string>("@config-path");
@@ -235,6 +301,14 @@ int main(int argc, char ** argv)
   const bool allow_fire = cli.get<int>("fire") != 0;
   const double timeout_s = cli.get<double>("timeout");
   const int dump_ui_every = cli.get<int>("dumpui");
+  if (
+    !std::isfinite(timeout_s) || timeout_s <= 0.0 ||
+    timeout_s > kMaxEngagementTimeoutSeconds) {
+    tools::logger()->error(
+      "[gestalt] invalid --timeout={}: require a finite value in (0, {}] seconds",
+      timeout_s, kMaxEngagementTimeoutSeconds);
+    return 2;
+  }
   if (pos != "far") {
     tools::logger()->error(
       "[gestalt] invalid --pos={}: use far (Blue outpost-lob point, AIMoveMode=5)",
@@ -406,11 +480,27 @@ int main(int argc, char ** argv)
   bool frame_identity_contract_ok = false;
   ExternalAimClaimHeartbeat claim_heartbeat(link);
   bool identity_contract_ok = true;
+  bool observed_match_end = false;
+  std::optional<uint64_t> verified_control_ws_generation;
   // A natural match settlement can occur while the controlled sentry is dead
   // and its combat map is being recycled. In that state there is no live
   // control target whose mode can be observed/restored; identity was already
   // proven for every live incarnation and the stopped lease is the safety gate.
   bool terminal_inactive_release_allowed = false;
+  // Set immediately before the engagement loop starts. Pre-match validation
+  // retains its short local readiness limit; every in-match re-arm may wait
+  // for game-owned physical recovery only until this global --timeout budget.
+  std::optional<std::chrono::steady_clock::time_point> engagement_deadline;
+  auto observe_engagement_match_end = [&] {
+    if (!bench_match || !engagement_deadline.has_value()) return false;
+    if (!observed_match_end && link.match_status() >= 2) {
+      observed_match_end = true;
+      claim_heartbeat.pause();
+      tools::logger()->info(
+        "[gestalt] natural match settlement latched; stopping claim heartbeat and gate commands");
+    }
+    return observed_match_end;
+  };
 
   auto is_expected_match_sentry = [&](int map_id) {
     return map_id > 0 &&
@@ -420,10 +510,11 @@ int main(int argc, char ** argv)
            link.player_entity_config(0).value_or(-1) == kHachisenEntityConfigId;
   };
 
-  auto ensure_frame_stream = [&]() {
+  auto ensure_frame_stream = [&](const std::function<bool()> & interrupted = {}) {
     if (cap_initialized) return true;
-    cap_initialized = cap.init(port, 15000);
+    cap_initialized = cap.init(port, 15000, interrupted);
     if (!cap_initialized) {
+      if (interrupted && interrupted()) return false;
       tools::logger()->error(
         "[gestalt] local frame stream unavailable; ensure the rebuilt game is running and "
         "r.VisionBridge.Enable=1");
@@ -437,9 +528,29 @@ int main(int argc, char ** argv)
     return true;
   };
 
-  auto verify_frame_contract = [&](const char * phase) {
+  auto verify_frame_contract =
+    [&](const char * phase, uint64_t gate_ws_generation) -> TakeoverGateResult {
     constexpr int kRequiredConsecutiveFrames = 3;
-    frame_identity_contract_ok = false;
+    auto frame_ws_intact = [&] {
+      return link.connected() && link.connection_generation() == gate_ws_generation;
+    };
+    auto fail_frame_ws = [&] {
+      claim_heartbeat.pause();
+      tools::logger()->error(
+        "[gestalt] {} frame gate aborted: WS generation changed expected={} observed={} "
+        "connected={}",
+        phase, gate_ws_generation, link.connection_generation(), link.connected());
+      return TakeoverGateResult::kFailed;
+    };
+    auto stop_for_frame_match_end = [&](const char * stage) {
+      if (!observe_engagement_match_end()) return false;
+      tools::logger()->info(
+        "[gestalt] {} frame gate stopped at {}: natural match settlement observed",
+        phase, stage);
+      return true;
+    };
+    if (stop_for_frame_match_end("entry")) return TakeoverGateResult::kMatchEnded;
+    if (!frame_ws_intact()) return fail_frame_ws();
     const auto deadline = std::chrono::steady_clock::now() + 10s;
     int consecutive = 0;
     uint64_t previous_frame_id = 0;
@@ -447,7 +558,11 @@ int main(int argc, char ** argv)
     uint32_t consecutive_epoch = 0;
     io::gestalt::CapturedFrame observed;
     while (std::chrono::steady_clock::now() < deadline) {
+      if (stop_for_frame_match_end("grab-before")) return TakeoverGateResult::kMatchEnded;
+      if (!frame_ws_intact()) return fail_frame_ws();
       auto frame = cap.grab(500);
+      if (stop_for_frame_match_end("grab-after")) return TakeoverGateResult::kMatchEnded;
+      if (!frame_ws_intact()) return fail_frame_ws();
       if (!frame.ok) continue;
       const bool strictly_new =
         (previous_frame_id == 0 || frame.frame_id > previous_frame_id) &&
@@ -478,6 +593,8 @@ int main(int argc, char ** argv)
         consecutive_epoch = 0;
       }
       if (consecutive >= kRequiredConsecutiveFrames) {
+        if (stop_for_frame_match_end("success")) return TakeoverGateResult::kMatchEnded;
+        if (!frame_ws_intact()) return fail_frame_ws();
         verified_takeover_epoch = consecutive_epoch;
         frame_identity_contract_ok = true;
         tools::logger()->info(
@@ -487,9 +604,11 @@ int main(int argc, char ** argv)
           frame.camera_arm_length_cm, frame.takeover_player_id,
           frame.takeover_attribute_map_id, frame.view_actor_unique_id,
           frame.takeover_epoch, frame.identity_flags);
-        return true;
+        return TakeoverGateResult::kPassed;
       }
     }
+    if (stop_for_frame_match_end("deadline")) return TakeoverGateResult::kMatchEnded;
+    if (!frame_ws_intact()) return fail_frame_ws();
     tools::logger()->error(
       "[gestalt] {} frame gate failed: got {}x{} fov={:.2f} arm={:.2f}cm frame={} "
       "expected {}x{} fov={:.2f} arm={:.2f}cm; identity pid={} map={} view={} target={} "
@@ -500,28 +619,84 @@ int main(int argc, char ** argv)
       observed.takeover_player_id, observed.takeover_attribute_map_id,
       observed.view_actor_unique_id, observed.takeover_target_unique_id,
       observed.takeover_epoch, observed.identity_flags);
-    return false;
+    return TakeoverGateResult::kFailed;
   };
 
   auto angle_error_degrees = [](double actual, double expected) {
     return std::abs(std::remainder(actual - expected, 360.0));
   };
 
-  auto verify_takeover_contract = [&](const char * phase) {
-    if (!wait_for(
-          [&] {
-            return static_cast<int>(link.attr(sentry, ga::kTargetMode).value_or(-1)) == 90;
-          },
-          5, 0.1)) {
+  auto verify_takeover_contract =
+    [&](const char * phase, uint64_t gate_ws_generation) -> TakeoverGateResult {
+    // One gate may never splice telemetry/effects across WebSocket sessions.
+    // The caller fixes the generation before its first claim/command; re-check
+    // that same generation through the final success decision.
+    auto gate_ws_intact = [&] {
+      return link.connected() && link.connection_generation() == gate_ws_generation;
+    };
+    auto require_gate_ws = [&](const char * stage) {
+      if (gate_ws_intact()) return true;
+      claim_heartbeat.pause();
+      tools::logger()->error(
+        "[gestalt] {} takeover gate aborted at {}: WS generation changed expected={} "
+        "observed={} connected={}",
+        phase, stage, gate_ws_generation, link.connection_generation(), link.connected());
+      return false;
+    };
+    auto match_ended = [&] { return observe_engagement_match_end(); };
+    auto stop_for_match_end = [&](const char * stage) {
+      if (!match_ended()) return false;
+      claim_heartbeat.pause();
+      tools::logger()->info(
+        "[gestalt] {} takeover gate stopped at {}: natural match settlement observed",
+        phase, stage);
+      return true;
+    };
+    if (stop_for_match_end("entry")) return TakeoverGateResult::kMatchEnded;
+    if (!require_gate_ws("entry")) return TakeoverGateResult::kFailed;
+    if (!claim_heartbeat.active_for(ext_pid, gate_ws_generation)) {
+      tools::logger()->error(
+        "[gestalt] {} takeover gate aborted: claim heartbeat is not bound to generation {}",
+        phase, gate_ws_generation);
+      return TakeoverGateResult::kFailed;
+    }
+
+    bool target_mode_ready = false;
+    const bool target_mode_wait_completed = wait_for(
+      [&] {
+        if (!gate_ws_intact() || match_ended()) return true;
+        target_mode_ready =
+          static_cast<int>(link.attr(sentry, ga::kTargetMode).value_or(-1)) == 90;
+        return target_mode_ready;
+      },
+      5, 0.1);
+    if (stop_for_match_end("mode90-wait")) return TakeoverGateResult::kMatchEnded;
+    if (!require_gate_ws("mode90-wait")) return TakeoverGateResult::kFailed;
+    if (!target_mode_wait_completed || !target_mode_ready) {
       tools::logger()->error(
         "[gestalt] {} takeover gate failed: map={} AITargetMode={} (expected 90)", phase,
         sentry, link.attr(sentry, ga::kTargetMode).value_or(-1));
-      return false;
+      return TakeoverGateResult::kFailed;
     }
     // RBTakeOver uses a 0.3 s view blend. Do not let three residual frames
     // from the previous pawn satisfy a post-revive camera contract.
-    std::this_thread::sleep_for(500ms);
-    if (!ensure_frame_stream() || !verify_frame_contract(phase)) return false;
+    wait_for([&] { return !gate_ws_intact() || match_ended(); }, 0.5, 0.05);
+    if (stop_for_match_end("view-blend")) return TakeoverGateResult::kMatchEnded;
+    if (!require_gate_ws("view-blend")) return TakeoverGateResult::kFailed;
+    const bool frame_stream_ready = ensure_frame_stream([&] {
+      return match_ended() || !gate_ws_intact();
+    });
+    if (!frame_stream_ready) {
+      if (stop_for_match_end("frame-stream-init")) return TakeoverGateResult::kMatchEnded;
+      if (!require_gate_ws("frame-stream-init")) return TakeoverGateResult::kFailed;
+      return TakeoverGateResult::kFailed;
+    }
+    if (stop_for_match_end("frame-stream-init")) return TakeoverGateResult::kMatchEnded;
+    if (!require_gate_ws("frame-stream-init")) return TakeoverGateResult::kFailed;
+    const auto frame_contract = verify_frame_contract(phase, gate_ws_generation);
+    if (frame_contract != TakeoverGateResult::kPassed) return frame_contract;
+    if (stop_for_match_end("frame-contract")) return TakeoverGateResult::kMatchEnded;
+    if (!require_gate_ws("frame-contract")) return TakeoverGateResult::kFailed;
 
     // An in-place revive publishes HP>0 before the formerly hidden vehicle has
     // necessarily recovered from its death pose. RBExtAim's world-to-motor
@@ -532,30 +707,63 @@ int main(int argc, char ** argv)
     // world-pitch envelope before applying the strict two-axis effect probe.
     constexpr double kTakeoverProbePitchEnvelopeDegrees = 55.0;
     std::optional<double> ready_yaw, ready_pitch;
-    const bool actuator_ready = wait_for(
+    const auto readiness_started = std::chrono::steady_clock::now();
+    const bool use_engagement_deadline = bench_match && engagement_deadline.has_value();
+    const double readiness_timeout_s = use_engagement_deadline
+      ? std::max(
+          0.0,
+          std::chrono::duration<double>(*engagement_deadline - readiness_started).count())
+      : 30.0;
+    bool readiness_satisfied = false;
+    bool readiness_match_ended = false;
+    const bool readiness_wait_completed = wait_for(
       [&] {
+        // A long Weakened interval is game-owned and is not itself a failure.
+        // During a live engagement, keep waiting without a second arbitrary
+        // cutoff, but stop safely if the session can no longer be controlled.
+        if (!gate_ws_intact()) return true;
+        if (match_ended()) {
+          readiness_match_ended = true;
+          return true;
+        }
         ready_yaw = link.attr(sentry, ga::kTurretYaw);
         ready_pitch = link.attr(sentry, ga::kTurretPitch);
-        return link.attr(sentry, ga::kHealth).value_or(0) > 0 &&
-               static_cast<int>(link.attr(sentry, ga::kDefeated).value_or(1)) == 0 &&
-               static_cast<int>(link.attr(sentry, ga::kCanOperate).value_or(0)) == 1 &&
-               static_cast<int>(link.attr(sentry, ga::kIsChassisOnline).value_or(0)) == 1 &&
-               static_cast<int>(link.attr(sentry, ga::kWeakened).value_or(1)) == 0 && ready_yaw &&
-               ready_pitch && std::abs(*ready_pitch) <= kTakeoverProbePitchEnvelopeDegrees;
+        readiness_satisfied =
+          link.attr(sentry, ga::kHealth).value_or(0) > 0 &&
+          static_cast<int>(link.attr(sentry, ga::kDefeated).value_or(1)) == 0 &&
+          static_cast<int>(link.attr(sentry, ga::kCanOperate).value_or(0)) == 1 &&
+          static_cast<int>(link.attr(sentry, ga::kIsChassisOnline).value_or(0)) == 1 &&
+          static_cast<int>(link.attr(sentry, ga::kWeakened).value_or(1)) == 0 && ready_yaw &&
+          ready_pitch && std::abs(*ready_pitch) <= kTakeoverProbePitchEnvelopeDegrees;
+        return readiness_satisfied;
       },
-      30, 0.1);
+      readiness_timeout_s, 0.1);
+    if (readiness_match_ended || stop_for_match_end("physical-readiness"))
+      return TakeoverGateResult::kMatchEnded;
+    if (!require_gate_ws("physical-readiness")) return TakeoverGateResult::kFailed;
+    const auto readiness_finished = std::chrono::steady_clock::now();
+    const bool readiness_within_deadline =
+      !use_engagement_deadline || readiness_finished < *engagement_deadline;
+    const bool actuator_ready =
+      readiness_wait_completed && readiness_satisfied && !readiness_match_ended &&
+      readiness_within_deadline;
+    const double readiness_waited_s =
+      std::chrono::duration<double>(readiness_finished - readiness_started).count();
     if (!actuator_ready) {
+      const char * readiness_stop = readiness_match_ended
+        ? "match-ended"
+        : (use_engagement_deadline ? "match-deadline" : "pre-match-30s-limit");
       tools::logger()->error(
         "[gestalt] {} takeover gate failed: actuator not physically ready map={} "
         "hp={:.0f} defeated={:.0f} can_operate={:.0f} chassis_online={:.0f} "
-        "weakened={:.0f} yaw={:.2f} pitch={:.2f}",
+        "weakened={:.0f} yaw={:.2f} pitch={:.2f} waited={:.1f}s stop={}",
         phase, sentry, link.attr(sentry, ga::kHealth).value_or(-1),
         link.attr(sentry, ga::kDefeated).value_or(-1),
         link.attr(sentry, ga::kCanOperate).value_or(-1),
         link.attr(sentry, ga::kIsChassisOnline).value_or(-1),
         link.attr(sentry, ga::kWeakened).value_or(-1), ready_yaw.value_or(0.0),
-        ready_pitch.value_or(0.0));
-      return false;
+        ready_pitch.value_or(0.0), readiness_waited_s, readiness_stop);
+      return TakeoverGateResult::kFailed;
     }
 
     constexpr int kResponseAttempts = 2;
@@ -574,15 +782,19 @@ int main(int argc, char ** argv)
     for (int attempt = 1; attempt <= kResponseAttempts && !responded; ++attempt) {
       yaw0.reset();
       pitch0.reset();
-      if (!wait_for(
-            [&] {
-              yaw0 = link.attr(sentry, ga::kTurretYaw);
-              pitch0 = link.attr(sentry, ga::kTurretPitch);
-              return yaw0.has_value() && pitch0.has_value();
-            },
-            3, 0.1)) {
+      const bool telemetry_wait_completed = wait_for(
+        [&] {
+          if (!gate_ws_intact() || match_ended()) return true;
+          yaw0 = link.attr(sentry, ga::kTurretYaw);
+          pitch0 = link.attr(sentry, ga::kTurretPitch);
+          return yaw0.has_value() && pitch0.has_value();
+        },
+        3, 0.1);
+      if (stop_for_match_end("turret-telemetry")) return TakeoverGateResult::kMatchEnded;
+      if (!require_gate_ws("turret-telemetry")) return TakeoverGateResult::kFailed;
+      if (!telemetry_wait_completed || !yaw0 || !pitch0) {
         tools::logger()->error("[gestalt] {} takeover gate failed: turret telemetry absent", phase);
-        return false;
+        return TakeoverGateResult::kFailed;
       }
 
       const double yaw_step = attempt % 2 == 1 ? 3.0 : -3.0;
@@ -591,9 +803,14 @@ int main(int argc, char ** argv)
         *pitch0 + (std::abs(*pitch0) < 1.0 ? 2.0 : (*pitch0 > 0 ? -2.0 : 2.0));
       const auto response_deadline = std::chrono::steady_clock::now() + 5s;
       while (std::chrono::steady_clock::now() < response_deadline) {
-        link.exec(fmt::format(
-          "UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, target_yaw, target_pitch));
+        if (!gate_ws_intact() || match_ended()) break;
+        if (!link.exec_if_generation(
+              fmt::format(
+                "UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, target_yaw, target_pitch),
+              gate_ws_generation))
+          break;
         std::this_thread::sleep_for(100ms);
+        if (!gate_ws_intact() || match_ended()) break;
         response_yaw = link.attr(sentry, ga::kTurretYaw);
         response_pitch = link.attr(sentry, ga::kTurretPitch);
         if (!response_yaw || !response_pitch) continue;
@@ -613,6 +830,8 @@ int main(int argc, char ** argv)
           break;
         }
       }
+      if (stop_for_match_end("RBExtAim-response")) return TakeoverGateResult::kMatchEnded;
+      if (!require_gate_ws("RBExtAim-response")) return TakeoverGateResult::kFailed;
 
       // The probe is deliberately non-firing and restores each attempt's entry
       // pose before retrying or allowing normal control to continue. Reversing
@@ -622,8 +841,14 @@ int main(int argc, char ** argv)
       restored = false;
       int consecutive_restore_samples = 0;
       while (std::chrono::steady_clock::now() < restore_deadline) {
-        link.exec(fmt::format("UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, *yaw0, *pitch0));
+        if (!gate_ws_intact() || match_ended()) break;
+        if (!link.exec_if_generation(
+              fmt::format(
+                "UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, *yaw0, *pitch0),
+              gate_ws_generation))
+          break;
         std::this_thread::sleep_for(100ms);
+        if (!gate_ws_intact() || match_ended()) break;
         restore_yaw = link.attr(sentry, ga::kTurretYaw);
         restore_pitch = link.attr(sentry, ga::kTurretPitch);
         if (
@@ -638,14 +863,21 @@ int main(int argc, char ** argv)
           consecutive_restore_samples = 0;
         }
       }
+      if (stop_for_match_end("RBExtAim-restore")) return TakeoverGateResult::kMatchEnded;
+      if (!require_gate_ws("RBExtAim-restore")) return TakeoverGateResult::kFailed;
       if (responded || !restored) break;
       tools::logger()->warn(
         "[gestalt] {} takeover response attempt {}/{} did not reach target; retrying "
         "after physical settle",
         phase, attempt, kResponseAttempts);
-      std::this_thread::sleep_for(1s);
+      wait_for([&] { return !gate_ws_intact() || match_ended(); }, 1.0, 0.05);
+      if (stop_for_match_end("response-retry-settle"))
+        return TakeoverGateResult::kMatchEnded;
+      if (!require_gate_ws("response-retry-settle")) return TakeoverGateResult::kFailed;
     }
 
+    if (stop_for_match_end("probe-result")) return TakeoverGateResult::kMatchEnded;
+    if (!require_gate_ws("probe-result")) return TakeoverGateResult::kFailed;
     if (!responded || !restored) {
       tools::logger()->error(
         "[gestalt] {} takeover gate failed: RBExtAim response={} pose_restore={} map={} "
@@ -659,13 +891,21 @@ int main(int argc, char ** argv)
         restore_yaw && yaw0 ? angle_error_degrees(*restore_yaw, *yaw0) : -1.0,
         restore_pitch.value_or(0.0),
         restore_pitch && pitch0 ? std::abs(*restore_pitch - *pitch0) : -1.0);
-      return false;
+      return TakeoverGateResult::kFailed;
+    }
+    if (stop_for_match_end("success")) return TakeoverGateResult::kMatchEnded;
+    if (!require_gate_ws("success")) return TakeoverGateResult::kFailed;
+    if (!claim_heartbeat.active_for(ext_pid, gate_ws_generation)) {
+      tools::logger()->error(
+        "[gestalt] {} takeover gate aborted at success: heartbeat generation binding lost",
+        phase);
+      return TakeoverGateResult::kFailed;
     }
     tools::logger()->info(
       "[gestalt] {} takeover gate passed: mode90 + frame contract + physically-ready "
-      "RBExtAim response (attempt {})",
-      phase, passed_attempt);
-    return true;
+      "RBExtAim response (readiness {:.1f}s, attempt {})",
+      phase, readiness_waited_s, passed_attempt);
+    return TakeoverGateResult::kPassed;
   };
 
   auto release_takeover = [&](const char * phase) {
@@ -731,7 +971,46 @@ int main(int argc, char ** argv)
     // invalidates the fov-25 first-person intrinsics; a pid-0 Respawn car uses
     // the same first-person takeover view as the bench). Chassis and economy
     // stay with the built-in AI after the claim.
-    if (!wait_for([&] { return link.match_status() >= 0; }, 60)) {
+    if (!wait_for([&] { return link.connected(); }, 60)) {
+      tools::logger()->error("[gestalt] WS unavailable during match prep");
+      return 2;
+    }
+    const auto pre_match_ws_generation = link.connection_generation();
+    tools::logger()->info(
+      "[gestalt] pre-match fixed WS generation={} before Respawn",
+      pre_match_ws_generation);
+    auto require_pre_match_ws = [&](const char * stage) {
+      if (
+        link.connected() && link.connection_generation() == pre_match_ws_generation)
+        return true;
+      claim_heartbeat.pause();
+      tools::logger()->error(
+        "[gestalt] pre-match arm aborted at {}: WS generation changed expected={} "
+        "observed={} connected={}",
+        stage, pre_match_ws_generation, link.connection_generation(), link.connected());
+      return false;
+    };
+    auto pre_match_exec = [&](const std::string & command, const char * stage) {
+      if (!require_pre_match_ws(stage)) return false;
+      if (!link.exec_if_generation(command, pre_match_ws_generation)) {
+        claim_heartbeat.pause();
+        tools::logger()->error(
+          "[gestalt] pre-match command refused at {} for generation={}", stage,
+          pre_match_ws_generation);
+        return false;
+      }
+      return require_pre_match_ws(stage);
+    };
+    bool prep_status_ready = false;
+    const bool prep_status_wait_completed = wait_for(
+      [&] {
+        if (!require_pre_match_ws("prep-status-wait")) return true;
+        prep_status_ready = link.match_status() >= 0;
+        return prep_status_ready;
+      },
+      60);
+    if (!require_pre_match_ws("prep-status-wait")) return 2;
+    if (!prep_status_wait_completed || !prep_status_ready) {
       tools::logger()->error("[gestalt] match status unavailable during prep");
       return 2;
     }
@@ -744,20 +1023,28 @@ int main(int argc, char ** argv)
     const int prev_map = link.find_player(0).value_or(-1);
     bool spawned = false;
     for (int attempt = 0; attempt < 3 && !spawned; ++attempt) {
-      link.exec(fmt::format("Respawn 0 {} {}", bench_shooter_entity, bench_shooter_team));
-      spawned = wait_for(
+      if (!pre_match_exec(
+            fmt::format("Respawn 0 {} {}", bench_shooter_entity, bench_shooter_team),
+            "spawn"))
+        return 2;
+      const bool spawn_wait_completed = wait_for(
         [&] {
+          if (!require_pre_match_ws("spawn-wait")) return true;
           auto cur = link.find_player(0);
           return cur && *cur > prev_map && link.attr(*cur, ga::kHealth).value_or(0) > 0 &&
                  is_expected_match_sentry(*cur);
         },
         15);
+      if (!require_pre_match_ws("spawn-wait")) return 2;
+      spawned = spawn_wait_completed;
     }
     if (!spawned) {
       tools::logger()->error("[gestalt] match sentry spawn failed after retries");
       return 1;
     }
-    sentry = *link.find_player(0);
+    const auto spawned_map = link.find_player(0);
+    if (!require_pre_match_ws("spawn-identity") || !spawned_map) return 2;
+    sentry = *spawned_map;
     if (!is_expected_match_sentry(sentry)) {
       tools::logger()->error(
         "[gestalt] spawned pid 0 failed red HACHISEN identity gate: map={} class={} team={} "
@@ -766,40 +1053,117 @@ int main(int argc, char ** argv)
         link.attr(sentry, ga::kTeamId).value_or(-1), link.player_entity_config(0).value_or(-1));
       return 2;
     }
+    if (!require_pre_match_ws("spawn-identity")) return 2;
     ext_pid = 0;
     outpost = link.find_red_outpost().value_or(-1);
-    link.exec(fmt::format("SetAttribute 0 {} 1", ga::kIsAI));
+    if (!pre_match_exec(fmt::format("SetAttribute 0 {} 1", ga::kIsAI), "set-is-ai")) {
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
     // ExtAimClaim atomically saves the strategy-owned target mode and switches
     // the current pawn to mode 90. Never pre-write 90 here: doing so destroys
     // the value the game must restore on release.
-    claim_heartbeat.activate(ext_pid);
-    link.exec("UEExec RBTakeOver 0");  // pid-0 pawn: same first-person gun view as the bench
+    if (!require_pre_match_ws("claim")) return 2;
+    if (!claim_heartbeat.activate(ext_pid, pre_match_ws_generation)) {
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
+    if (!require_pre_match_ws("claim")) {
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
+    if (!pre_match_exec("UEExec RBTakeOver 0", "takeover")) {
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
     // One-time starting ammo grant (Respawn leaves the player allowance at 0);
     // in-match resupply afterwards is the built-in AI's business.
-    link.exec(fmt::format("SetAttribute 0 {} {}", ga::kAllowance17mm, bench_allowance));
-    link.exec("UEExec r.MotionBlurQuality 0");
-    link.exec("UEExec r.AntiAliasingMethod 1");
-    link.exec("UEExec r.RobotNav.DebugDraw 0");
-    link.exec("UEExec t.MaxFPS 30");
-    link.exec("UEExec r.VisionBridge.Enable 1");
-    if (!ensure_frame_stream()) {
+    const std::pair<std::string, const char *> pre_match_commands[] = {
+      {fmt::format("SetAttribute 0 {} {}", ga::kAllowance17mm, bench_allowance), "ammo"},
+      {"UEExec r.MotionBlurQuality 0", "motion-blur"},
+      {"UEExec r.AntiAliasingMethod 1", "anti-aliasing"},
+      {"UEExec r.RobotNav.DebugDraw 0", "nav-debug"},
+      {"UEExec t.MaxFPS 30", "max-fps"},
+      {"UEExec r.VisionBridge.Enable 1", "vision-bridge"},
+    };
+    for (const auto & [command, stage] : pre_match_commands) {
+      if (pre_match_exec(command, stage)) continue;
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
+    if (
+        !require_pre_match_ws("frame-stream-init") ||
+        !ensure_frame_stream([&] {
+          return !link.connected() ||
+                 link.connection_generation() != pre_match_ws_generation;
+        }) ||
+        !require_pre_match_ws("frame-stream-init")) {
       release_takeover("pre-match-init-failure");
       return 2;
     }
-    link.apply_camera(camera_json);
-    if (!verify_takeover_contract("pre-match")) {
+    if (!require_pre_match_ws("apply-camera")) {
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
+    if (!link.apply_camera_if_generation(camera_json, pre_match_ws_generation)) {
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
+    if (!require_pre_match_ws("apply-camera")) {
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
+    const auto pre_match_gate =
+      verify_takeover_contract("pre-match", pre_match_ws_generation);
+    if (pre_match_gate != TakeoverGateResult::kPassed) {
       release_takeover("pre-match-gate-failure");
+      return 2;
+    }
+    if (!require_pre_match_ws("match-start")) {
+      release_takeover("pre-match-generation-failure");
       return 2;
     }
     if (link.match_status() < 1) {
       tools::logger()->info("[gestalt] armed — starting the match with pid 0 already claimed");
-      link.exec("SetMatchStatus 1");
-      if (!wait_for([&] { return link.match_status() >= 1; }, 30)) {
+      if (!pre_match_exec("SetMatchStatus 1", "match-start")) {
+        release_takeover("pre-match-generation-failure");
+        return 2;
+      }
+      bool match_started = false;
+      const bool match_start_wait_completed = wait_for(
+        [&] {
+          if (!require_pre_match_ws("match-start-wait")) return true;
+          match_started = link.match_status() >= 1;
+          return match_started;
+        },
+        30);
+      if (!require_pre_match_ws("match-start-wait")) {
+        release_takeover("pre-match-generation-failure");
+        return 2;
+      }
+      if (!match_start_wait_completed || !match_started) {
         tools::logger()->error("[gestalt] SetMatchStatus 1 had no observable effect");
         release_takeover("match-start-failure");
         return 2;
       }
     }
+    if (
+      !require_pre_match_ws("verified-generation-output") ||
+      !claim_heartbeat.active_for(ext_pid, pre_match_ws_generation)) {
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
+    verified_control_ws_generation = pre_match_ws_generation;
+    if (
+      !require_pre_match_ws("verified-generation-output-final") ||
+      !claim_heartbeat.active_for(ext_pid, *verified_control_ws_generation)) {
+      verified_control_ws_generation.reset();
+      release_takeover("pre-match-generation-failure");
+      return 2;
+    }
+    tools::logger()->info(
+      "[gestalt] pre-match verified WS generation output={}",
+      *verified_control_ws_generation);
     tools::logger()->info(
       "[gestalt] match takeover: sentry map={} pid=0 team={} hp={} match_status={}", sentry,
       bench_shooter_team, link.attr(sentry, ga::kHealth).value_or(-1), link.match_status());
@@ -907,7 +1271,8 @@ int main(int argc, char ** argv)
     link.exec(fmt::format("SetAttribute 0 {} 2", ga::kMoveMode));      // hold
     // Claim owns the mode-90 transition and remembers the prior mode for
     // release; do not pre-write target mode here.
-    claim_heartbeat.activate(ext_pid);
+    const auto setup_ws_generation = link.connection_generation();
+    if (!claim_heartbeat.activate(ext_pid, setup_ws_generation)) return 2;
     link.exec("UEExec RBTakeOver 0");  // guarantee the viewport IS the gun view
     // Respawn does NOT refill the 17mm allowance (player-scoped) — reset it so
     // every run starts with exactly the configured round budget.
@@ -1079,9 +1444,23 @@ int main(int argc, char ** argv)
 
   // ---------- capture + the ORIGINAL auto_aim chain ----------
   // The no-setup diagnostic historically acquired its claim on the first loop
-  // heartbeat. Start the independent lease here instead; setup/match paths are
-  // idempotent renewals of the claim they already established.
-  claim_heartbeat.activate(ext_pid);
+  // heartbeat. Start the independent lease here instead; match mode preserves
+  // the exact generation-bound lease proven by its pre-match gate.
+  if (bench_match) {
+    if (
+      !verified_control_ws_generation || !link.connected() ||
+      link.connection_generation() != *verified_control_ws_generation ||
+      !claim_heartbeat.active_for(ext_pid, *verified_control_ws_generation)) {
+      tools::logger()->error(
+        "[gestalt] refusing engagement: pre-match verified WS generation was not preserved");
+      release_takeover("pre-engagement-generation-failure");
+      return 2;
+    }
+  } else {
+    const auto initial_ws_generation = link.connection_generation();
+    if (!claim_heartbeat.activate(ext_pid, initial_ws_generation)) return 2;
+    verified_control_ws_generation = initial_ws_generation;
+  }
   if (!ensure_frame_stream()) return 1;
 
   // Sim render calibration: the UE lightbars are drawn INSET vs the physical
@@ -1164,7 +1543,6 @@ int main(int argc, char ** argv)
   int lives_lost = 0;
   double last_revive_wait_s = 0;
   bool takeover_contract_ok = true;
-  bool observed_match_end = false;
 
   // Async debug window: imshow/waitKey stall 40-80ms on this box — feeding a
   // UI thread through a latest-frame mailbox keeps the vision loop under the
@@ -1211,6 +1589,7 @@ int main(int argc, char ** argv)
   auto t_last_scan_step = t_last_ctrl;
   int frames = 0, det_frames = 0, cmds = 0, fire_cmds = 0, grab_fail = 0;
   bool last_fire_sent = false;
+  uint64_t ws_generation = verified_control_ws_generation.value_or(0);
   // RBExtAim carries a latched input bit in the game. A lost target, capture
   // failure, death, or shutdown must actively send fire=0; merely stopping
   // RBExtAim commands (or releasing ExtAimClaim) does not clear that bit.
@@ -1218,31 +1597,106 @@ int main(int argc, char ** argv)
     if (!force && !last_fire_sent) return;
     const double yaw = link.attr(sentry, ga::kTurretYaw).value_or(0.0);
     const double pitch = link.attr(sentry, ga::kTurretPitch).value_or(0.0);
-    link.exec(fmt::format("UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, yaw, pitch));
+    if (ws_generation == 0 ||
+        !link.exec_if_generation(
+          fmt::format("UEExec RBExtAim {} {:.2f} {:.2f} 0", ext_pid, yaw, pitch),
+          ws_generation)) {
+      // Never redirect even a fire-clear absolute-angle command to a fresh
+      // socket before that generation has passed the full takeover gate. The
+      // native 0.75s watchdog clears any old latched trigger if this send is
+      // refused; pausing the lease forces the next loop through re-arm.
+      claim_heartbeat.pause();
+      tools::logger()->warn(
+        "[gestalt] fire-clear refused for verified generation={} observed={} connected={}",
+        ws_generation, link.connection_generation(), link.connected());
+    } else {
+      cmds++;
+    }
     last_fire_sent = false;
-    cmds++;
   };
-  uint64_t ws_generation = link.connection_generation();
+  if (!verified_control_ws_generation) {
+    tools::logger()->error("[gestalt] no verified WS generation available for control loop");
+    ui_quit = true;
+    if (ui_thread.joinable()) ui_thread.join();
+    release_takeover("missing-generation-output");
+    return 2;
+  }
+  ws_generation = *verified_control_ws_generation;
+  if (
+    !link.connected() || link.connection_generation() != ws_generation ||
+    !claim_heartbeat.active_for(ext_pid, ws_generation)) {
+    tools::logger()->error(
+      "[gestalt] verified WS generation changed before control loop: expected={} observed={} "
+      "connected={}",
+      ws_generation, link.connection_generation(), link.connected());
+    ui_quit = true;
+    if (ui_thread.joinable()) ui_thread.join();
+    release_takeover("generation-changed-before-loop");
+    return 2;
+  }
   bool ws_continuity_clean = true;
   bool frame_writer_contract_ok = cap.process_id() != 0;
   bool capture_recovery_pending = false;
-  auto rearm_takeover = [&](const char * phase, bool reinitialize_capture) {
-    if (!wait_for([&] { return link.connected(); }, 20, 0.1)) {
+  auto rearm_takeover =
+    [&](const char * phase, bool reinitialize_capture) -> GenerationBoundGateResult {
+    auto outcome = [](TakeoverGateResult result, uint64_t generation = 0) {
+      return GenerationBoundGateResult{result, generation};
+    };
+    bool rearm_connected = false;
+    const bool connect_wait_completed = wait_for(
+      [&] {
+        if (observe_engagement_match_end()) return true;
+        rearm_connected = link.connected();
+        return rearm_connected;
+      },
+      20, 0.1);
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!connect_wait_completed || !rearm_connected) {
       tools::logger()->error("[gestalt] {} re-arm failed: WS is not connected", phase);
-      return false;
+      return outcome(TakeoverGateResult::kFailed);
     }
+    const auto rearm_ws_generation = link.connection_generation();
+    tools::logger()->info(
+      "[gestalt] {} re-arm fixed WS generation={} before claim",
+      phase, rearm_ws_generation);
+    auto require_rearm_ws = [&](const char * stage) {
+      if (link.connected() && link.connection_generation() == rearm_ws_generation) return true;
+      claim_heartbeat.pause();
+      tools::logger()->error(
+        "[gestalt] {} re-arm aborted at {}: WS generation changed expected={} observed={} "
+        "connected={}",
+        phase, stage, rearm_ws_generation, link.connection_generation(), link.connected());
+      return false;
+    };
+    auto rearm_exec = [&](const std::string & command, const char * stage) {
+      if (observe_engagement_match_end() || !require_rearm_ws(stage)) return false;
+      if (!link.exec_if_generation(command, rearm_ws_generation)) {
+        claim_heartbeat.pause();
+        tools::logger()->error(
+          "[gestalt] {} re-arm command refused at {} for generation={}",
+          phase, stage, rearm_ws_generation);
+        return false;
+      }
+      return !observe_engagement_match_end() && require_rearm_ws(stage);
+    };
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("entry")) return outcome(TakeoverGateResult::kFailed);
     std::optional<int> current;
-    if (!wait_for(
-          [&] {
-            current = link.find_player(ext_pid);
-            return current && *current == sentry &&
-              link.attr(*current, ga::kHealth).value_or(0) > 0;
-          },
-          15, 0.1)) {
+    const bool current_wait_completed = wait_for(
+      [&] {
+        if (observe_engagement_match_end() || !require_rearm_ws("live-map-wait")) return true;
+        current = link.find_player(ext_pid);
+        return current && *current == sentry && link.attr(*current, ga::kHealth).value_or(0) > 0;
+      },
+      15, 0.1);
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("live-map-wait")) return outcome(TakeoverGateResult::kFailed);
+    if (!current_wait_completed || !current || *current != sentry ||
+        link.attr(*current, ga::kHealth).value_or(0) <= 0) {
       tools::logger()->error(
         "[gestalt] {} re-arm failed: controlled={} pid_current={} is not the expected live map",
         phase, sentry, current.value_or(-1));
-      return false;
+      return outcome(TakeoverGateResult::kFailed);
     }
     if (bench_match && !is_expected_match_sentry(*current)) {
       identity_contract_ok = false;
@@ -1251,21 +1705,83 @@ int main(int argc, char ** argv)
         phase, *current, link.attr(*current, ga::kClass).value_or(-1),
         link.attr(*current, ga::kTeamId).value_or(-1),
         link.player_entity_config(ext_pid).value_or(-1));
-      return false;
+      return outcome(TakeoverGateResult::kFailed);
     }
-    claim_heartbeat.activate(ext_pid);
-    link.exec(fmt::format("UEExec RBTakeOver {}", ext_pid));
-    link.exec("UEExec r.VisionBridge.Enable 1");
-    link.exec("UEExec r.MotionBlurQuality 0");
-    link.exec("UEExec r.AntiAliasingMethod 1");
-    link.exec("UEExec r.RobotNav.DebugDraw 0");
-    link.exec("UEExec t.MaxFPS 30");
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("identity")) return outcome(TakeoverGateResult::kFailed);
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("claim")) return outcome(TakeoverGateResult::kFailed);
+    if (!claim_heartbeat.activate(ext_pid, rearm_ws_generation))
+      return outcome(TakeoverGateResult::kFailed);
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("claim")) return outcome(TakeoverGateResult::kFailed);
+    const std::pair<std::string, const char *> rearm_commands[] = {
+      {fmt::format("UEExec RBTakeOver {}", ext_pid), "takeover"},
+      {"UEExec r.VisionBridge.Enable 1", "vision-bridge"},
+      {"UEExec r.MotionBlurQuality 0", "motion-blur"},
+      {"UEExec r.AntiAliasingMethod 1", "anti-aliasing"},
+      {"UEExec r.RobotNav.DebugDraw 0", "nav-debug"},
+      {"UEExec t.MaxFPS 30", "max-fps"},
+    };
+    for (const auto & [command, stage] : rearm_commands)
+      if (!rearm_exec(command, stage))
+        return outcome(
+          observe_engagement_match_end() ? TakeoverGateResult::kMatchEnded
+                                         : TakeoverGateResult::kFailed);
     if (reinitialize_capture) cap_initialized = false;
-    if (!ensure_frame_stream()) return false;
-    link.apply_camera(camera_json);
-    if (!verify_takeover_contract(phase)) return false;
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("frame-stream-init")) return outcome(TakeoverGateResult::kFailed);
+    const bool frame_stream_ready = ensure_frame_stream([&] {
+      return observe_engagement_match_end() ||
+             !link.connected() || link.connection_generation() != rearm_ws_generation;
+    });
+    if (!frame_stream_ready) {
+      if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+      if (!require_rearm_ws("frame-stream-init")) return outcome(TakeoverGateResult::kFailed);
+      return outcome(TakeoverGateResult::kFailed);
+    }
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("frame-stream-init")) return outcome(TakeoverGateResult::kFailed);
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("apply-camera")) return outcome(TakeoverGateResult::kFailed);
+    if (!link.apply_camera_if_generation(camera_json, rearm_ws_generation))
+      return outcome(TakeoverGateResult::kFailed);
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("apply-camera")) return outcome(TakeoverGateResult::kFailed);
+    const auto gate_result = verify_takeover_contract(phase, rearm_ws_generation);
+    if (gate_result != TakeoverGateResult::kPassed) return outcome(gate_result);
+    if (observe_engagement_match_end()) return outcome(TakeoverGateResult::kMatchEnded);
+    if (!require_rearm_ws("success-before-output"))
+      return outcome(TakeoverGateResult::kFailed);
+    if (!claim_heartbeat.active_for(ext_pid, rearm_ws_generation))
+      return outcome(TakeoverGateResult::kFailed);
     frame_writer_contract_ok =
       frame_writer_contract_ok && cap.process_id() != 0;
+    const auto verified = outcome(TakeoverGateResult::kPassed, rearm_ws_generation);
+    if (observe_engagement_match_end())
+      return outcome(TakeoverGateResult::kMatchEnded);
+    if (
+      !require_rearm_ws("success-after-output") ||
+      !claim_heartbeat.active_for(ext_pid, verified.ws_generation))
+      return outcome(TakeoverGateResult::kFailed);
+    tools::logger()->info(
+      "[gestalt] {} re-arm verified WS generation output={}",
+      phase, verified.ws_generation);
+    return verified;
+  };
+  auto adopt_rearm_generation = [&](const GenerationBoundGateResult & gate, const char * phase) {
+    if (gate.result != TakeoverGateResult::kPassed) return false;
+    if (
+      gate.ws_generation == 0 || !link.connected() ||
+      link.connection_generation() != gate.ws_generation ||
+      !claim_heartbeat.active_for(ext_pid, gate.ws_generation)) {
+      claim_heartbeat.pause();
+      tools::logger()->error(
+        "[gestalt] {} caller rejected verified generation output={} observed={} connected={}",
+        phase, gate.ws_generation, link.connection_generation(), link.connected());
+      return false;
+    }
+    ws_generation = gate.ws_generation;
     return true;
   };
   // Per-hit damage calibration: histogram of discrete HP drops observed on the
@@ -1331,7 +1847,11 @@ int main(int argc, char ** argv)
     double t1 = d / (v0 * std::cos(p1)), t2 = d / (v0 * std::cos(p2));
     return t1 < t2 ? std::make_pair(p1, t1) : std::make_pair(p2, t2);
   };
-  auto t_end = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_s);
+  const auto t_end =
+    std::chrono::steady_clock::now() +
+    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(timeout_s));
+  engagement_deadline = t_end;
   auto t_log = std::chrono::steady_clock::now();
 
   bool hp_seen = false;
@@ -1341,13 +1861,15 @@ int main(int argc, char ** argv)
     // connection paired with the old generation and skip the full re-arm.
     const bool ws_connected = link.connected();
     const auto current_generation = link.connection_generation();
-    if (!ws_connected || current_generation != ws_generation) {
+    const bool heartbeat_bound = claim_heartbeat.active_for(ext_pid, ws_generation);
+    if (!ws_connected || current_generation != ws_generation || !heartbeat_bound) {
       ws_continuity_clean = false;
       release_fire(true);
       claim_heartbeat.pause();
       tools::logger()->warn(
-        "[gestalt] WS continuity lost: generation {} -> {}; pausing claim until full re-arm",
-        ws_generation, current_generation);
+        "[gestalt] WS continuity lost: generation {} -> {} heartbeat_bound={}; pausing claim "
+        "until full re-arm",
+        ws_generation, current_generation, heartbeat_bound);
       if (!wait_for([&] { return link.connected(); }, 20, 0.1)) {
         takeover_contract_ok = false;
         tools::logger()->error("[gestalt] WS did not reconnect within 20s; failing safely");
@@ -1362,12 +1884,16 @@ int main(int argc, char ** argv)
         observed_match_end = true;
         break;
       }
-      if (!rearm_takeover("ws-recovery", true)) {
+      const auto ws_rearm = rearm_takeover("ws-recovery", true);
+      if (ws_rearm.result == TakeoverGateResult::kMatchEnded) {
+        observed_match_end = true;
+        break;
+      }
+      if (!adopt_rearm_generation(ws_rearm, "ws-recovery")) {
         takeover_contract_ok = false;
         tools::logger()->error("[gestalt] WS recovery failed full takeover gate");
         break;
       }
-      ws_generation = link.connection_generation();
       ws_continuity_clean = true;
       capture_recovery_pending = false;
       grab_fail = 0;
@@ -1403,7 +1929,13 @@ int main(int argc, char ** argv)
       // without reporting the five-second safety lease as an expired claim
       // while we wait (which may take minutes) for the game-owned revive.
       claim_heartbeat.pause();
-      link.exec(fmt::format("ExtAimClaim {} 0", ext_pid));
+      if (!link.exec_if_generation(
+            fmt::format("ExtAimClaim {} 0", ext_pid), ws_generation)) {
+        tools::logger()->warn(
+          "[gestalt] death release refused for verified generation={} observed={} "
+          "connected={}; relying on claim lease expiry",
+          ws_generation, link.connection_generation(), link.connected());
+      }
       tools::logger()->info(
         "[gestalt] own sentry down (life {} lost, dealt so far {:.0f}) — waiting for revive",
         lives_lost, dealt_carry);
@@ -1488,13 +2020,17 @@ int main(int argc, char ** argv)
       // (observed: damage_dealt 377 → 15 across otherwise identical matches).
       const bool reconnect_during_death =
         !ws_continuity_clean || link.connection_generation() != ws_generation;
-      if (!rearm_takeover("post-revive", reconnect_during_death)) {
+      const auto revive_rearm = rearm_takeover("post-revive", reconnect_during_death);
+      if (revive_rearm.result == TakeoverGateResult::kMatchEnded) {
+        observed_match_end = true;
+        break;
+      }
+      if (!adopt_rearm_generation(revive_rearm, "post-revive")) {
         takeover_contract_ok = false;
         tools::logger()->error(
           "[gestalt] post-revive effect gate failed; refusing to resume control loop");
         break;
       }
-      ws_generation = link.connection_generation();
       ws_continuity_clean = true;
       tools::logger()->info(
         "[gestalt] game revived our sentry after {:.0f}s: map={} (life {})",
@@ -1504,10 +2040,7 @@ int main(int argc, char ** argv)
     if (!bench_match && hp_seen && allow <= 0) break;
     // Match takeover: economy belongs to the built-in AI (allowance may dip to
     // 0 until it re-buys), so only a settled match (or timeout) ends the run.
-    if (bench_match && link.match_status() >= 2) {
-      observed_match_end = true;
-      break;
-    }
+    if (observe_engagement_match_end()) break;
 
     auto now = std::chrono::steady_clock::now();
 
@@ -1523,7 +2056,12 @@ int main(int argc, char ** argv)
       if (grab_fail >= 10) capture_recovery_pending = true;
       if (grab_fail >= 100) {
         release_fire(true);
-        if (!rearm_takeover("capture-recovery", true)) {
+        const auto capture_rearm = rearm_takeover("capture-recovery", true);
+        if (capture_rearm.result == TakeoverGateResult::kMatchEnded) {
+          observed_match_end = true;
+          break;
+        }
+        if (!adopt_rearm_generation(capture_rearm, "capture-recovery")) {
           takeover_contract_ok = false;
           tools::logger()->error(
             "[gestalt] capture did not recover through the full takeover gate");
@@ -1560,7 +2098,12 @@ int main(int argc, char ** argv)
         frame.takeover_player_id, frame.takeover_attribute_map_id,
         frame.view_actor_unique_id, frame.takeover_target_unique_id, frame.takeover_epoch,
         ext_pid, sentry, verified_takeover_epoch, frame.identity_flags);
-      if (!rearm_takeover("view-identity-recovery", false)) {
+      const auto identity_rearm = rearm_takeover("view-identity-recovery", false);
+      if (identity_rearm.result == TakeoverGateResult::kMatchEnded) {
+        observed_match_end = true;
+        break;
+      }
+      if (!adopt_rearm_generation(identity_rearm, "view-identity-recovery")) {
         takeover_contract_ok = false;
         frame_identity_contract_ok = false;
         tools::logger()->error("[gestalt] rendered-view identity recovery failed full gate");
@@ -1572,7 +2115,12 @@ int main(int argc, char ** argv)
     }
     if (capture_recovery_pending) {
       release_fire(true);
-      if (!rearm_takeover("capture-recovery", false)) {
+      const auto capture_rearm = rearm_takeover("capture-recovery", false);
+      if (capture_rearm.result == TakeoverGateResult::kMatchEnded) {
+        observed_match_end = true;
+        break;
+      }
+      if (!adopt_rearm_generation(capture_rearm, "capture-recovery")) {
         takeover_contract_ok = false;
         tools::logger()->error("[gestalt] capture recovery failed full takeover gate");
         break;
@@ -2134,16 +2682,32 @@ int main(int argc, char ** argv)
       auto obs_now = std::chrono::steady_clock::now();
       if (sweep_idx < sweep.size()) {
         if (!sweep_phase_started) {
+          if (observe_engagement_match_end()) break;
           const auto & p = sweep[sweep_idx];
-          if (!p.camera.empty()) link.apply_camera(p.camera);
+          bool phase_commands_sent = true;
+          if (!p.camera.empty())
+            phase_commands_sent =
+              link.apply_camera_if_generation(p.camera, ws_generation);
           if (!p.exec.empty()) {  // '|'-separated console commands
             std::string rest = p.exec;
             size_t bar;
-            while ((bar = rest.find('|')) != std::string::npos) {
-              link.exec(rest.substr(0, bar));
+            while (
+              phase_commands_sent && (bar = rest.find('|')) != std::string::npos) {
+              phase_commands_sent =
+                link.exec_if_generation(rest.substr(0, bar), ws_generation);
               rest = rest.substr(bar + 1);
             }
-            if (!rest.empty()) link.exec(rest);
+            if (phase_commands_sent && !rest.empty())
+              phase_commands_sent = link.exec_if_generation(rest, ws_generation);
+          }
+          if (!phase_commands_sent) {
+            claim_heartbeat.pause();
+            ws_continuity_clean = false;
+            tools::logger()->warn(
+              "[gestalt] observe sweep command refused for verified generation={} "
+              "observed={} connected={}; forcing full re-arm",
+              ws_generation, link.connection_generation(), link.connected());
+            continue;
           }
           std::this_thread::sleep_for(2500ms);  // settle render/exposure
           sweep_t0 = std::chrono::steady_clock::now();
@@ -2210,6 +2774,7 @@ int main(int argc, char ** argv)
       // no commands in observe mode
     }
     if (!mode_observe && command.control) {
+      if (observe_engagement_match_end()) break;
       Eigen::Vector3d gimbal_pos{tyaw, tpitch, 0};
       fire = allow_fire && shooter.shoot(command, aimer, targets, gimbal_pos);
       double ue_pitch_up_deg = -command.pitch * kRad2Deg;  // aimer is down-positive
@@ -2230,9 +2795,20 @@ int main(int argc, char ** argv)
       const double cmd_yaw_deg_internal = command.yaw * kRad2Deg;
       const double cmd_yaw_deg = -cmd_yaw_deg_internal;  // RH sp_vision -> LH UE
       const double cmd_pitch_deg = ue_pitch_up_deg;
-      link.exec(fmt::format(
-        "UEExec RBExtAim {} {:.2f} {:.2f} {}", ext_pid, cmd_yaw_deg, cmd_pitch_deg,
-        fire ? 1 : 0));
+      if (!link.exec_if_generation(
+            fmt::format(
+              "UEExec RBExtAim {} {:.2f} {:.2f} {}", ext_pid, cmd_yaw_deg,
+              cmd_pitch_deg, fire ? 1 : 0),
+            ws_generation)) {
+        claim_heartbeat.pause();
+        ws_continuity_clean = false;
+        last_fire_sent = false;
+        tools::logger()->warn(
+          "[gestalt] aim command refused for verified generation={} observed={} "
+          "connected={}; forcing full re-arm",
+          ws_generation, link.connection_generation(), link.connected());
+        continue;
+      }
       last_fire_sent = fire;
       cmds++;
       if (fire) fire_cmds++;
@@ -2306,11 +2882,24 @@ int main(int argc, char ** argv)
           }
         }
         if (scan_active) {
+          if (observe_engagement_match_end()) break;
           scan_yaw_deg = std::remainder(scan_yaw_deg, 360.0);
-          link.exec(fmt::format(
-            "UEExec RBExtAim {} {:.1f} {:.1f} 0 {:.0f} {:.0f}", ext_pid, scan_yaw_deg,
-            scan_pitch_deg, raw_detection ? 0.0 : kScanRateDegS,
-            raw_detection ? 0.0 : scan_pitch_dir * kScanPitchRateDegS));
+          if (!link.exec_if_generation(
+                fmt::format(
+                  "UEExec RBExtAim {} {:.1f} {:.1f} 0 {:.0f} {:.0f}", ext_pid,
+                  scan_yaw_deg, scan_pitch_deg, raw_detection ? 0.0 : kScanRateDegS,
+                  raw_detection ? 0.0 : scan_pitch_dir * kScanPitchRateDegS),
+                ws_generation)) {
+            claim_heartbeat.pause();
+            ws_continuity_clean = false;
+            scan_active = false;
+            last_fire_sent = false;
+            tools::logger()->warn(
+              "[gestalt] scan command refused for verified generation={} observed={} "
+              "connected={}; forcing full re-arm",
+              ws_generation, link.connection_generation(), link.connected());
+            continue;
+          }
           last_fire_sent = false;
           cmds++;
         }
@@ -2412,7 +3001,7 @@ int main(int argc, char ** argv)
 
   // Latch natural settlement before teardown: MatchStatus may return to prep
   // after its short settled-state display window.
-  observed_match_end = observed_match_end || (bench_match && link.match_status() >= 2);
+  if (bench_match) observe_engagement_match_end();
   if (bench_match && observed_match_end && current_life_accounted) {
     terminal_inactive_release_allowed = true;
   }
