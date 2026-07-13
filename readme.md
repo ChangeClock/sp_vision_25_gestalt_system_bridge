@@ -13,9 +13,12 @@
 本分支增加了一个面向 `gestalt_system` 的本地闭环入口，同时保留原有真机/Linux 路径：
 
 - `src/gestalt.cpp` 复用原 YOLO、PnP、Tracker、EKF、Aimer 和 Shooter，不在游戏侧重写自瞄决策。
-- `io/gestalt/shared_frame_capture.*` 从进程私有共享内存读取最终视口像素，以及渲染该帧的同一份 `frame id / QPC / world time / camera position / camera quaternion / FOV`。姿态不经过 AttributeMap、TS 或网络广播。
+- `io/gestalt/shared_frame_capture.*` 从进程私有共享内存读取最终视口像素，以及渲染该帧的同一份 `frame id / QPC / world time / camera position / camera quaternion / FOV / camera arm length / takeover identity`。协议 v3 除实际吊臂长度外，还原子导出 ViewActor/接管目标 unique id、pid、attribute-map、takeover epoch 与 identity flags；姿态/身份不经过 AttributeMap、TS 或网络广播。
 - `io/gestalt/game_link.*` 仅承担测试场景属性读取和 `RBExtAim` 控制命令，不向 EKF 注入目标位置、相位或转速真值。
 - Windows 构建通过 `GESTALT_EIGEN_INCLUDE`、`GESTALT_EXTRA_INCLUDE`、`GESTALT_EASYWS_DIR` 和 `OpenVINO_DIR` 指定依赖；Linux 原构建保持原有硬件 I/O 与 planner 路径。
+
+发布包的启动参数、Shipping opt-in 白名单、完整对局与无日志验收见
+[`docs/ai-cookbook-command-guide.md`](docs/ai-cookbook-command-guide.md)。
 
 典型运行方式：
 
@@ -70,7 +73,7 @@ powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSe
 
 ### 实战整局接管（gestalt_match_sentry.yaml）
 
-`bench_match: true` 走"赛前接管"编排：prep 阶段手动生成 HACHISEN 哨兵（`66000005`，SKM_Sentry 底盘）→ mode90+ExtAimClaim+RBTakeOver 认领 → 布相机/帧桥 → 自己发 `SetMatchStatus 1` 开赛——**比赛第 0 秒即外控**。底盘导航与补给经济全留给内置 AI；阵亡后复活交给游戏逻辑，桥只显示复活进度并在复活后重挂视角。丢锁 >2s 时云台巡扫：yaw 60°/s 整圈旋转 + pitch ±15° 三角波（周期非整数比→螺旋覆盖不同仰角带，纯水平扫会漏枪线下方近距目标），有原始检测即两轴冻结让 tracker 收敛。
+`bench_match: true` 走"赛前接管"编排：先完成 OpenVINO 模型编译、黑帧 infer warmup 与 solver/tracker/aimer/shooter 构造，再在 prep 阶段手动生成 HACHISEN 哨兵（`66000005`，SKM_Sentry 底盘）并以 `PlayerID=0 + TeamID=0 + Class=1004 + ConnectionEntityConfigId=66000005` 四重验证 → ExtAimClaim（由游戏原子保存旧 TargetMode 并切到 mode90）+RBTakeOver 认领 → 布相机/帧桥 → 连续新帧/分辨率/FOV/armLength/TargetMode/RBExtAim 小角度响应全部效果门通过 → 自己发 `SetMatchStatus 1` 开赛——**比赛第 0 秒即外控**，任一赛前门失败绝不开赛。claim 由独立线程每秒续租，不受模型推理或 15s 采集等待阻塞；阵亡等待时主动停租，复活后才重启。游戏侧 5s claim lease 与 0.75s fire watchdog 会在进程崩溃/断连后自动恢复内置瞄准并释放锁存扳机。底盘导航与补给经济全留给内置 AI；阵亡后复活交给游戏逻辑，桥只接受比尸体 map id 更高且身份仍正确的新存活 map，并按 claim→view→camera 顺序重挂，重复完整效果门后才恢复控制循环。WS 或帧采集恢复也必须重新 claim/takeover/apply camera 并通过完整门，否则安全失败。共享帧严格绑定请求 WS 端口的监听进程 PID，避免多游戏 publisher 串流。丢锁 >2s 时云台巡扫：yaw 60°/s 整圈旋转 + pitch ±15° 三角波（周期非整数比→螺旋覆盖不同仰角带，纯水平扫会漏枪线下方近距目标）。扫描按真实 `steady_clock` 时间推进且限制卡帧步长；pitch 带外会平滑回带；tracker 前的 `armors_ui` 原始检测一出现就用当前遥测 yaw/pitch 冻结两轴，而不是继续命令旧扫描目标。
 
 ```powershell
 powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSeconds 900 -MapId 4 -ResX 1280 -ResY 720
@@ -78,9 +81,9 @@ powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSe
 ```
 
 - **哨兵底盘的 Tower 相机预设自带 400cm 追尾吊臂**（`Camera.csv`），接管即第三人称且破坏枪口外参——camera_json 里 `"armLength":0` 收回吊臂（需配套的游戏侧 applySettings 键，2026-07-13 已落地）。
-- RESULT 增加 `damage_dealt=`（DamageAppliedTotal 差值，跨命累计）与 `lives_lost=`；match 模式下 hp 口径=自身存活，damaging_hits/hit_rate 无意义。
+- RESULT 增加 `damage_dealt=`（DamageAppliedTotal 差值，跨命累计且死亡结转只计一次）、`lives_lost=`、`match_status=`、`match_end_seen=`、`pid0_hachisen=`、`frame_writer_gate=`、`view_identity_gate=`、`takeover_epoch=`、`ws_continuity_gate=` 与 `capture_recovery_gate=`；match 模式用 `damage_dealt / bench_damage_per_hit` 估算 damaging_hits/hit_rate。自然结算一经观察即锁存（结算展示后 MatchStatus 可能回到 0）。仅当自然结算已出现、帧/检测/实际出膛/伤害均非零、所有重挂效果门、pid0 红方 HACHISEN 身份、WS/帧 writer 同进程、渲染 ViewActor 身份、断线/采集恢复均已完成整套重挂门，并且当前 pid map release 恢复通过时，才返回 `RESULT=MATCH_COMPLETE`/退出码 0，否则 `MATCH_FAILED`/退出码 2。若自然结算恰逢哨兵阵亡且 combat map 已回收，则沿用该生命存活期已通过的四重身份；显式 release 后保持 heartbeat 停止满 5s，以“无存活控制对象”作为安全释放门，不要求回收 map 的陈旧 TargetMode 缓存变化。
 - 2026-07-13 整局基线（红方 HACHISEN，~6.3min）：183 发、det 0.264、对敌伤害 377（≈8.5% 实战命中）、阵亡 4 次全部由游戏复活并自动续接，内置 AI 经济中途补弹至 700+。
-- **复活后必须重新 apply 相机**：新 pawn 会回落到构型默认（Tower 400cm 吊臂 + FOV90），内参/外参双错但检测仍有输出，症状极隐蔽（对照实验 damage_dealt 377→15）。桥的复活路径已内置重挂。
+- **复活后必须重新 apply 相机并验效果**：新 pawn 会回落到构型默认（Tower 400cm 吊臂 + FOV90），内参/外参双错但检测仍有输出，症状极隐蔽（对照实验 damage_dealt 377→15）。桥的复活路径已内置重挂，并从共享帧协议 v3 连续校验实际 FOV/armLength、ViewActor==takeover target、pid/map 与同一非零 epoch 后才继续。
 
 ### 附：gestalt 模拟器调用速查（WS / AutoStart，人类版）
 
@@ -115,7 +118,7 @@ powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSe
 |---|---|
 | `Respawn <pid> <entity_id> <team>` | 生成/重生车辆。哨兵(HACHISEN)=66000005、步兵=66000002、突击步兵=66000008、英雄=66000001。异步，等新的更高 map id 且 hp>0（老尸体快照陷阱） |
 | `SetAttribute <pid> <attr_id> <value>` | 精确写单车属性（勿用 BatchSet 广播误伤同队） |
-| `ExtAimClaim <pid> <0\|1>` | 认领/交还外部瞄准：策略每 tick 后同周期回写 AITargetMode=90，内置自瞄抢不回 |
+| `ExtAimClaim <pid> <0\|1>` | 认领/交还外部瞄准：claim 原子保存旧 AITargetMode 并设 90，策略每 tick 后同周期守住；同一 claim 每秒重发作为 heartbeat，5s 无续租自动恢复；release 恢复旧值。调用者不可在 claim 前自行写 90，否则会破坏可恢复性 |
 | `UEExec RBExtAim <pid> <yaw°> <pitch°> [fire01] [yawVel°/s] [pitchVel°/s]` | 世界系绝对角瞄准+开火请求（开火仍过热量/弹量/CanOperate 全部原生门） |
 | `UEExec RBTakeOver <pid>` | 视口切到该车第一人称枪管视角（帧桥导出的就是视口） |
 | `UEExec RBNavGoto <pid> <x_cm> <y_cm> [z_cm]` / `RBNavLab goto ...` | 任意坐标导航（50cm 自动清；英雄级底盘停靠带 ~3m，判到达用 350cm） |
@@ -126,7 +129,7 @@ powershell -File scripts/ai-match-selftest.ps1 -SkipMatchStart 1 -MatchObserveSe
 | `UEExec r.VisionBridge.Enable 1` | 开共享内存帧桥（像素+同帧相机位姿，SHM 按游戏 PID 命名） |
 | `UEExec r.AntiAliasingMethod 1` / `r.MotionBlurQuality 0` / `r.RobotNav.DebugDraw 0` / `t.MaxFPS 30` | 渲染四件套：FXAA 防拖影 / 关运动模糊 / 关导航调试线 / 限帧让 CPU 给检测器 |
 
-**AutoStart 语义**：`ai-match-selftest.ps1` 默认启动即开赛（AI 双方全启）；`-SkipMatchStart 1` 停在 prep 阶段（无比赛 AI、自动隐 HUD+静音、keep-alive `MatchObserveSeconds` 秒），由外部程序自行 `SetMatchStatus 1`。就绪判据：游戏日志出现 `[AutoStart] Game start result: success=true` 且 `.wsport` sidecar 已写出。全部外控命令 `!UE_BUILD_SHIPPING` 门控（编辑器/Development 可用，真 Shipping 不可用）。
+**AutoStart / Shipping 语义**：`ai-match-selftest.ps1` 默认启动即开赛（AI 双方全启）；`-SkipMatchStart 1` 停在 prep 阶段（无比赛 AI、自动隐 HUD+静音、keep-alive `MatchObserveSeconds` 秒），由外部程序自行 `SetMatchStatus 1`。Development 可直接调试；Preview 与最终 Shipping 均走 Shipping 代码分支。发布包授权必须显式带裸 `-externalvisioncontrol` 与 `-wsbind=127.0.0.1`；完整共享帧流程再带 `-visionbridge` 预启 SHM。这只放行外部视觉最小命令白名单，并不会开放任意 UEExec。Preview 可用日志辅助就绪；最终 Shipping 以 `.wsport` sidecar、WS 属性效果和共享帧递增判定。完整矩阵见 [`docs/ai-cookbook-command-guide.md`](docs/ai-cookbook-command-guide.md)。
 
 ### 完整复现流程（从零到整局接管）
 
